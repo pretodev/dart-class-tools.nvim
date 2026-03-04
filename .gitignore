@@ -1,0 +1,17 @@
+# Lua
+.luarocks/
+lua_modules/
+*.rock
+
+# Neovim
+*.swp
+*.swo
+*~
+tags
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp
+/tmp/
