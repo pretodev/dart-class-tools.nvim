@@ -471,6 +471,36 @@ function M.missing_fields(wanted, existing)
   return missing
 end
 
+--- Find field names that are in `existing` (block) but not in `wanted` (class fields).
+--- These are "orphan" fields — referenced by the block but no longer present in the class.
+---@param wanted string[]
+---@param existing string[]
+---@return string[]
+function M.orphan_fields(wanted, existing)
+  local want_set = {}
+  for _, n in ipairs(wanted) do want_set[n] = true end
+  local orphans = {}
+  for _, n in ipairs(existing) do
+    if not want_set[n] then
+      orphans[#orphans + 1] = n
+    end
+  end
+  return orphans
+end
+
+--- Check if a block has any field mismatch with the class (missing OR orphan fields).
+---@param block MethodBlock|nil
+---@param class_fields string[]
+---@return boolean
+function M.has_field_mismatch(block, class_fields)
+  if not block then return false end
+  local missing = M.missing_fields(class_fields, block.fields)
+  if #missing > 0 then return true end
+  local orphans = M.orphan_fields(class_fields, block.fields)
+  if #orphans > 0 then return true end
+  return false
+end
+
 --- Check if two field lists cover the same set of names (order-independent).
 ---@param a string[]
 ---@param b string[]
@@ -489,17 +519,25 @@ end
 -- Block status: "absent" | "incomplete" | "complete"
 --------------------------------------------------------------------------------
 
----@alias BlockStatus "absent"|"incomplete"|"complete"
+---@alias BlockStatus "absent"|"incomplete"|"stale"|"complete"
 
 --- Determine the status of a method block.
+--- "absent"     — block does not exist
+--- "incomplete" — block exists but is missing fields (new fields not covered)
+--- "stale"      — block exists but has orphan fields (references removed fields)
+---                Note: a block that is both incomplete AND stale is reported as "stale"
+---                since stale implies the block is out of sync with the class.
+--- "complete"   — block exists and field sets match exactly
 ---@param block MethodBlock|nil
 ---@param class_fields string[]
 ---@return BlockStatus
 function M.block_status(block, class_fields)
   if not block then return "absent" end
+  local orphans = M.orphan_fields(class_fields, block.fields)
   local missing = M.missing_fields(class_fields, block.fields)
-  if #missing == 0 then return "complete" end
-  return "incomplete"
+  if #orphans > 0 then return "stale" end
+  if #missing > 0 then return "incomplete" end
+  return "complete"
 end
 
 --- For toJson/fromJson which are thin wrappers, status is just present/absent.

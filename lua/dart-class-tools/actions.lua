@@ -97,6 +97,8 @@ local function action_title(kind, status)
 
   if status == "incomplete" then
     return "Update " .. name .. " (add missing fields)"
+  elseif status == "stale" then
+    return "Update " .. name .. " (sync with fields)"
   elseif status == "absent" then
     return "Generate " .. name
   else
@@ -351,13 +353,13 @@ function M.get_code_actions(bufnr, cursor_line)
 
   local actions = {}
 
-  -- Data class action: show if ANY kind is absent or incomplete
+  -- Data class action: show if ANY kind is absent, incomplete, or stale
   if not clazz:is_widget() then
     local any_needed = false
     for _, kind in ipairs(ALL_KINDS) do
       if kinds[kind] then
         local s = statuses[kind]
-        if s == "absent" or s == "incomplete" then
+        if s == "absent" or s == "incomplete" or s == "stale" then
           any_needed = true
           break
         end
@@ -384,7 +386,49 @@ function M.get_code_actions(bufnr, cursor_line)
     end
   end
 
-  -- Individual actions: only show if absent or incomplete
+  -- "Update existing members" action: show when any EXISTING block has a
+  -- field mismatch (incomplete or stale), but never create absent blocks.
+  -- This is useful when fields have been added, removed, or renamed.
+  do
+    local update_kinds = {}
+    for _, kind in ipairs(ALL_KINDS) do
+      if kinds[kind] then
+        local s = statuses[kind]
+        if s == "incomplete" or s == "stale" then
+          update_kinds[#update_kinds + 1] = kind
+        end
+      end
+    end
+
+    -- toJson/fromJson are thin wrappers that depend on toMap/fromMap.
+    -- If toMap is being updated and toJson exists, also update toJson (and vice versa).
+    -- But only if the wrapper already exists (never create).
+    if #update_kinds > 0 then
+      local update_set = {}
+      for _, k in ipairs(update_kinds) do update_set[k] = true end
+      if update_set.toMap and statuses.toJson == "complete" then
+        if not update_set.toJson then
+          update_kinds[#update_kinds + 1] = "toJson"
+        end
+      end
+      if update_set.fromMap and statuses.fromJson == "complete" then
+        if not update_set.fromJson then
+          update_kinds[#update_kinds + 1] = "fromJson"
+        end
+      end
+
+      actions[#actions + 1] = {
+        title = "Update existing members",
+        kind = "quickfix",
+        bufnr = bufnr,
+        clazz = clazz,
+        action_kinds = update_kinds,
+        update_existing_only = true,
+      }
+    end
+  end
+
+  -- Individual actions: only show if absent, incomplete, or stale
   for _, kind in ipairs(ALL_KINDS) do
     if not kinds[kind] then goto continue end
 
@@ -397,7 +441,7 @@ function M.get_code_actions(bufnr, cursor_line)
       local hc_status = statuses.hashCode
       -- If both are complete, skip
       if status == "complete" and hc_status == "complete" then goto continue end
-      -- If either is absent/incomplete, show action
+      -- If either is absent/incomplete/stale, show action
       if status == "complete" and hc_status ~= "complete" then
         status = hc_status
       end

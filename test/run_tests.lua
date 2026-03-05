@@ -3899,6 +3899,720 @@ class Product {
 end
 
 --------------------------------------------------------------------------------
+-- "Update existing members" tests
+--
+-- Tests for the new feature that updates ONLY existing members to match
+-- current fields without creating new members.
+--------------------------------------------------------------------------------
+io.write("\n=== Update Existing Members Tests ===\n")
+
+-- Load actions module for testing get_code_actions / statuses
+local actions = require("dart-class-tools.actions")
+
+--- Helper: apply "update existing members" to a class.
+--- Only regenerates blocks that already exist and have field mismatches.
+--- Never creates new (absent) blocks.
+---@param buf_lines string[] 1-indexed lines
+---@param class_name string target class
+---@return string[] new_lines, string new_text, number edit_count
+local function apply_update_existing(buf_lines, class_name)
+  local text = table.concat(buf_lines, "\n")
+  local clazzes = parser.parse_classes(text)
+  local clazz = parser.find_class_by_name(clazzes, class_name)
+  if not clazz then
+    error("apply_update_existing: could not find class '" .. class_name .. "'")
+  end
+
+  local blocks = incremental.detect_blocks(clazz, buf_lines)
+  local class_fields = incremental.get_class_field_names(clazz)
+
+  -- Collect kinds that already exist and have field mismatches
+  local update_kinds = {}
+  local all_kinds = { "constructor", "copyWith", "toMap", "fromMap", "toJson", "fromJson", "toString", "equality", "hashCode" }
+  for _, kind in ipairs(all_kinds) do
+    local block = blocks[kind]
+    if block then
+      if kind == "toJson" or kind == "fromJson" then
+        -- Wrappers: no field tracking, but include if underlying map method is being updated
+        -- (handled below)
+      else
+        if incremental.has_field_mismatch(block, class_fields) then
+          update_kinds[#update_kinds + 1] = kind
+        end
+      end
+    end
+  end
+
+  -- Also include toJson/fromJson if toMap/fromMap are being updated and the wrappers exist
+  local update_set = {}
+  for _, k in ipairs(update_kinds) do update_set[k] = true end
+  if update_set.toMap and blocks.toJson then
+    if not update_set.toJson then
+      update_kinds[#update_kinds + 1] = "toJson"
+    end
+  end
+  if update_set.fromMap and blocks.fromJson then
+    if not update_set.fromJson then
+      update_kinds[#update_kinds + 1] = "fromJson"
+    end
+  end
+
+  local edits = {}
+  for _, kind in ipairs(update_kinds) do
+    local gen_text
+    if kind == "constructor" then
+      gen_text = generator.generate_constructor(clazz)
+    elseif kind == "copyWith" then
+      gen_text = (generator.generate_copy_with(clazz))
+    elseif kind == "toMap" then
+      gen_text = generator.generate_to_map(clazz)
+    elseif kind == "fromMap" then
+      gen_text = (generator.generate_from_map(clazz))
+    elseif kind == "toJson" then
+      gen_text = (generator.generate_to_json(clazz))
+    elseif kind == "fromJson" then
+      gen_text = (generator.generate_from_json(clazz))
+    elseif kind == "toString" then
+      gen_text = generator.generate_to_string(clazz)
+    elseif kind == "equality" then
+      gen_text = (generator.generate_equality(clazz))
+    elseif kind == "hashCode" then
+      gen_text = (generator.generate_hash_code(clazz))
+    end
+    if gen_text then
+      local edit = incremental.build_edit(kind, clazz, blocks, gen_text)
+      if edit then
+        edits[#edits + 1] = edit
+      end
+    end
+  end
+
+  local new_lines = incremental.apply_edits(buf_lines, edits)
+  return new_lines, table.concat(new_lines, "\n"), #edits
+end
+
+-- ===========================================================================
+-- Unit tests for orphan_fields and has_field_mismatch
+-- ===========================================================================
+io.write("\n--- Unit: orphan_fields / has_field_mismatch ---\n")
+do
+  -- orphan_fields: fields in block but not in class
+  local orphans = incremental.orphan_fields({"name", "age"}, {"name", "age", "email"})
+  eq(#orphans, 1, "orphan_fields: one orphan when block has extra field")
+  eq(orphans[1], "email", "orphan_fields: orphan is 'email'")
+
+  local orphans2 = incremental.orphan_fields({"name", "age"}, {"name", "age"})
+  eq(#orphans2, 0, "orphan_fields: no orphans when sets match")
+
+  local orphans3 = incremental.orphan_fields({"name", "age", "birthday"}, {"name", "age"})
+  eq(#orphans3, 0, "orphan_fields: no orphans when block is subset of class")
+
+  local orphans4 = incremental.orphan_fields({}, {"name"})
+  eq(#orphans4, 1, "orphan_fields: all block fields are orphans when class has no fields")
+
+  -- has_field_mismatch
+  local block_complete = { fields = {"name", "age"} }
+  eq(incremental.has_field_mismatch(block_complete, {"name", "age"}), false, "has_field_mismatch: no mismatch when matching")
+
+  local block_missing = { fields = {"name"} }
+  eq(incremental.has_field_mismatch(block_missing, {"name", "age"}), true, "has_field_mismatch: mismatch when field missing")
+
+  local block_orphan = { fields = {"name", "age", "email"} }
+  eq(incremental.has_field_mismatch(block_orphan, {"name", "age"}), true, "has_field_mismatch: mismatch when orphan field")
+
+  eq(incremental.has_field_mismatch(nil, {"name"}), false, "has_field_mismatch: nil block returns false")
+end
+
+-- ===========================================================================
+-- Unit tests for block_status returning "stale"
+-- ===========================================================================
+io.write("\n--- Unit: block_status stale detection ---\n")
+do
+  eq(incremental.block_status(nil, {"name"}), "absent", "block_status: nil block is absent")
+  eq(incremental.block_status({ fields = {"name", "age"} }, {"name", "age"}), "complete", "block_status: matching fields is complete")
+  eq(incremental.block_status({ fields = {"name"} }, {"name", "age"}), "incomplete", "block_status: missing field is incomplete")
+  eq(incremental.block_status({ fields = {"name", "age", "email"} }, {"name", "age"}), "stale", "block_status: orphan field is stale")
+  eq(incremental.block_status({ fields = {"name", "email"} }, {"name", "age"}), "stale", "block_status: both orphan and missing is stale")
+  eq(incremental.block_status({ fields = {"email"} }, {"name"}), "stale", "block_status: completely different fields is stale")
+end
+
+-- ===========================================================================
+-- Test 1: Field removed — update constructor and copyWith only (no toMap etc.)
+-- ===========================================================================
+io.write("\n--- Update Existing: field removed (constructor + copyWith only) ---\n")
+do
+  local text = [[class User {
+  final String name;
+  final int age;
+
+  const User({
+    required this.name,
+    required this.age,
+  });
+
+  User copyWith({
+    String? name,
+    int? age,
+  }) {
+    return User(
+      name: name ?? this.name,
+      age: age ?? this.age,
+    );
+  }
+}
+]]
+  -- Remove 'age' field, keeping only 'name'
+  local modified = text:gsub("  final int age;\n", "")
+  local lines = {}
+  for line in (modified .. "\n"):gmatch("([^\n]*)\n") do
+    lines[#lines + 1] = line
+  end
+
+  -- Check status
+  local clazz = parser.find_class_by_name(parser.parse_classes(modified), "User")
+  ok(clazz ~= nil, "Update Existing Field Removed: class parsed")
+  local blocks = incremental.detect_blocks(clazz, lines)
+  local class_fields = incremental.get_class_field_names(clazz)
+  eq(incremental.block_status(blocks.constructor, class_fields), "stale", "Update Existing Field Removed: constructor is stale")
+  eq(incremental.block_status(blocks.copyWith, class_fields), "stale", "Update Existing Field Removed: copyWith is stale")
+
+  -- Apply update existing
+  local new_lines, new_text, edit_count = apply_update_existing(lines, "User")
+  ok(edit_count > 0, "Update Existing Field Removed: edits produced")
+
+  -- Verify constructor updated
+  ok(new_text:find("required this.name"), "Update Existing Field Removed: constructor has name")
+  ok(not new_text:find("required this.age"), "Update Existing Field Removed: constructor no longer has age")
+
+  -- Verify copyWith updated
+  ok(new_text:find("name %?%? this%.name"), "Update Existing Field Removed: copyWith has name")
+  ok(not new_text:find("age %?%? this%.age"), "Update Existing Field Removed: copyWith no longer has age")
+
+  -- Verify no toMap, fromMap, etc. were created
+  ok(not new_text:find("toMap"), "Update Existing Field Removed: no toMap created")
+  ok(not new_text:find("fromMap"), "Update Existing Field Removed: no fromMap created")
+  ok(not new_text:find("toString"), "Update Existing Field Removed: no toString created")
+  ok(not new_text:find("operator =="), "Update Existing Field Removed: no equality created")
+  ok(not new_text:find("hashCode"), "Update Existing Field Removed: no hashCode created")
+
+  -- Idempotency
+  local new_lines2, _, edit_count2 = apply_update_existing(new_lines, "User")
+  eq(edit_count2, 0, "Update Existing Field Removed: idempotent (0 edits on second run)")
+end
+
+-- ===========================================================================
+-- Test 2: Field renamed — simulated by removing old + having new field
+-- ===========================================================================
+io.write("\n--- Update Existing: field renamed (age → birthday) ---\n")
+do
+  local text = [[class Person {
+  final String name;
+  final DateTime birthday;
+
+  const Person({
+    required this.name,
+    required this.age,
+  });
+
+  Person copyWith({
+    String? name,
+    int? age,
+  }) {
+    return Person(
+      name: name ?? this.name,
+      age: age ?? this.age,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'Person(name: $name, age: $age)';
+  }
+
+  @override
+  bool operator ==(Object other) {
+    if (identical(this, other)) return true;
+    return other is Person && other.name == name && other.age == age;
+  }
+
+  @override
+  int get hashCode {
+    return name.hashCode ^ age.hashCode;
+  }
+}
+]]
+  local lines = {}
+  for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+    lines[#lines + 1] = line
+  end
+
+  local clazz = parser.find_class_by_name(parser.parse_classes(text), "Person")
+  ok(clazz ~= nil, "Update Existing Rename: class parsed")
+  local blocks = incremental.detect_blocks(clazz, lines)
+  local class_fields = incremental.get_class_field_names(clazz)
+  -- Constructor references this.name and this.age, but class has name + birthday
+  eq(incremental.block_status(blocks.constructor, class_fields), "stale", "Update Existing Rename: constructor is stale")
+
+  local new_lines, new_text, edit_count = apply_update_existing(lines, "Person")
+  ok(edit_count > 0, "Update Existing Rename: edits produced")
+
+  -- Constructor should have birthday, not age
+  ok(new_text:find("required this.birthday"), "Update Existing Rename: constructor has birthday")
+  ok(not new_text:find("required this.age"), "Update Existing Rename: constructor no longer has age")
+
+  -- copyWith should have birthday, not age
+  ok(new_text:find("birthday %?%? this%.birthday"), "Update Existing Rename: copyWith has birthday")
+  ok(not new_text:find("age %?%? this%.age"), "Update Existing Rename: copyWith no longer has age")
+
+  -- toString should have birthday, not age
+  ok(new_text:find("birthday: %$birthday"), "Update Existing Rename: toString has birthday")
+  ok(not new_text:find("age: %$age"), "Update Existing Rename: toString no longer has age")
+
+  -- equality should have birthday, not age
+  ok(new_text:find("other%.birthday"), "Update Existing Rename: equality has birthday")
+  ok(not new_text:find("other%.age"), "Update Existing Rename: equality no longer has age")
+
+  -- hashCode should have birthday, not age
+  ok(new_text:find("birthday%.hashCode"), "Update Existing Rename: hashCode has birthday")
+  ok(not new_text:find("age%.hashCode"), "Update Existing Rename: hashCode no longer has age")
+
+  -- Idempotency
+  local _, _, edit_count2 = apply_update_existing(new_lines, "Person")
+  eq(edit_count2, 0, "Update Existing Rename: idempotent")
+end
+
+-- ===========================================================================
+-- Test 3: Field added — update existing but don't create absent
+-- ===========================================================================
+io.write("\n--- Update Existing: field added (only existing members updated) ---\n")
+do
+  local text = [[class Config {
+  final String host;
+  final int port;
+  final String apiKey;
+
+  const Config({
+    required this.host,
+    required this.port,
+  });
+
+  @override
+  String toString() {
+    return 'Config(host: $host, port: $port)';
+  }
+}
+]]
+  local lines = {}
+  for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+    lines[#lines + 1] = line
+  end
+
+  local clazz = parser.find_class_by_name(parser.parse_classes(text), "Config")
+  local blocks = incremental.detect_blocks(clazz, lines)
+  local class_fields = incremental.get_class_field_names(clazz)
+
+  -- Constructor and toString are incomplete (missing apiKey)
+  eq(incremental.block_status(blocks.constructor, class_fields), "incomplete", "Update Existing Add Field: constructor is incomplete")
+  eq(incremental.block_status(blocks.toString, class_fields), "incomplete", "Update Existing Add Field: toString is incomplete")
+
+  local new_lines, new_text, edit_count = apply_update_existing(lines, "Config")
+  ok(edit_count > 0, "Update Existing Add Field: edits produced")
+
+  -- Constructor should now have apiKey
+  ok(new_text:find("required this.apiKey"), "Update Existing Add Field: constructor has apiKey")
+  ok(new_text:find("required this.host"), "Update Existing Add Field: constructor still has host")
+
+  -- toString should now have apiKey
+  ok(new_text:find("apiKey: %$apiKey"), "Update Existing Add Field: toString has apiKey")
+
+  -- No copyWith, toMap, fromMap, equality, hashCode should be created
+  ok(not new_text:find("copyWith"), "Update Existing Add Field: no copyWith created")
+  ok(not new_text:find("toMap"), "Update Existing Add Field: no toMap created")
+  ok(not new_text:find("fromMap"), "Update Existing Add Field: no fromMap created")
+  ok(not new_text:find("operator =="), "Update Existing Add Field: no equality created")
+  ok(not new_text:find("hashCode"), "Update Existing Add Field: no hashCode created")
+
+  -- Idempotency
+  local _, _, edit_count2 = apply_update_existing(new_lines, "Config")
+  eq(edit_count2, 0, "Update Existing Add Field: idempotent")
+end
+
+-- ===========================================================================
+-- Test 4: Positional constructor style preserved
+-- ===========================================================================
+io.write("\n--- Update Existing: positional constructor style preserved ---\n")
+do
+  local text = [[class Point {
+  final double x;
+  final double y;
+  final double z;
+
+  const Point(this.x, this.y);
+}
+]]
+  local lines = {}
+  for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+    lines[#lines + 1] = line
+  end
+
+  local clazz = parser.find_class_by_name(parser.parse_classes(text), "Point")
+  local blocks = incremental.detect_blocks(clazz, lines)
+  local class_fields = incremental.get_class_field_names(clazz)
+  -- Constructor has x, y but class has x, y, z => incomplete
+  eq(incremental.block_status(blocks.constructor, class_fields), "incomplete", "Update Existing Positional: constructor is incomplete")
+
+  local new_lines, new_text, edit_count = apply_update_existing(lines, "Point")
+  ok(edit_count > 0, "Update Existing Positional: edits produced")
+
+  -- Should preserve positional style (no { or [) and add z
+  ok(new_text:find("this%.x"), "Update Existing Positional: constructor has x")
+  ok(new_text:find("this%.y"), "Update Existing Positional: constructor has y")
+  ok(new_text:find("this%.z"), "Update Existing Positional: constructor has z")
+
+  -- Idempotency
+  local _, _, edit_count2 = apply_update_existing(new_lines, "Point")
+  eq(edit_count2, 0, "Update Existing Positional: idempotent")
+end
+
+-- ===========================================================================
+-- Test 5: Mixed — field removed + field added (age removed, birthday+gender added)
+-- ===========================================================================
+io.write("\n--- Update Existing: mixed changes (remove + add fields) ---\n")
+do
+  local text = [[class User {
+  final String name;
+  final DateTime birthday;
+  final String gender;
+
+  const User(this.name, {required this.age});
+
+  User copyWith({
+    String? name,
+    int? age,
+  }) {
+    return User(
+      name ?? this.name,
+      age: age ?? this.age,
+    );
+  }
+}
+]]
+  local lines = {}
+  for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+    lines[#lines + 1] = line
+  end
+
+  local clazz = parser.find_class_by_name(parser.parse_classes(text), "User")
+  ok(clazz ~= nil, "Update Existing Mixed: class parsed")
+  local blocks = incremental.detect_blocks(clazz, lines)
+  local class_fields = incremental.get_class_field_names(clazz)
+  eq(incremental.block_status(blocks.constructor, class_fields), "stale", "Update Existing Mixed: constructor is stale")
+  eq(incremental.block_status(blocks.copyWith, class_fields), "stale", "Update Existing Mixed: copyWith is stale")
+
+  local new_lines, new_text, edit_count = apply_update_existing(lines, "User")
+  ok(edit_count > 0, "Update Existing Mixed: edits produced")
+
+  -- Constructor should have name, birthday, gender (no age)
+  -- Note: mixed bracket style (positional start, named end) is preserved;
+  -- generator uses ( ... }) which doesn't add "required" prefix
+  ok(new_text:find("this%.name"), "Update Existing Mixed: constructor has name")
+  ok(new_text:find("this%.birthday"), "Update Existing Mixed: constructor has birthday")
+  ok(new_text:find("this%.gender"), "Update Existing Mixed: constructor has gender")
+  ok(not new_text:find("this%.age"), "Update Existing Mixed: constructor no longer has age")
+
+  -- copyWith should have name, birthday, gender (no age)
+  ok(new_text:find("name %?%? this%.name"), "Update Existing Mixed: copyWith has name")
+  ok(new_text:find("birthday %?%? this%.birthday"), "Update Existing Mixed: copyWith has birthday")
+  ok(new_text:find("gender %?%? this%.gender"), "Update Existing Mixed: copyWith has gender")
+  ok(not new_text:find("age %?%? this%.age"), "Update Existing Mixed: copyWith no longer has age")
+
+  -- Idempotency
+  local _, _, edit_count2 = apply_update_existing(new_lines, "User")
+  eq(edit_count2, 0, "Update Existing Mixed: idempotent")
+end
+
+-- ===========================================================================
+-- Test 6: Full data class with all members — remove a field
+-- ===========================================================================
+io.write("\n--- Update Existing: full data class, remove field ---\n")
+do
+  -- First generate a full data class, then remove a field and update existing
+  local text = [[class Product {
+  final String name;
+  final double price;
+  final int quantity;
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  -- Generate all members
+  local full_lines, full_text, _ = generate_all_incremental(clazz, lines)
+  ok(full_text:find("toMap"), "Update Existing Full: toMap generated")
+  ok(full_text:find("fromMap"), "Update Existing Full: fromMap generated")
+  ok(full_text:find("toJson"), "Update Existing Full: toJson generated")
+
+  -- Now simulate removing 'quantity' field from the class
+  local modified = full_text:gsub("  final int quantity;\n", "")
+  local mod_lines = {}
+  for line in (modified .. "\n"):gmatch("([^\n]*)\n") do
+    mod_lines[#mod_lines + 1] = line
+  end
+
+  -- Verify status
+  local mod_clazz = parser.find_class_by_name(parser.parse_classes(modified), "Product")
+  ok(mod_clazz ~= nil, "Update Existing Full Remove: class re-parsed")
+  local mod_blocks = incremental.detect_blocks(mod_clazz, mod_lines)
+  local mod_fields = incremental.get_class_field_names(mod_clazz)
+  eq(incremental.block_status(mod_blocks.constructor, mod_fields), "stale", "Update Existing Full Remove: constructor stale")
+  eq(incremental.block_status(mod_blocks.copyWith, mod_fields), "stale", "Update Existing Full Remove: copyWith stale")
+  eq(incremental.block_status(mod_blocks.toMap, mod_fields), "stale", "Update Existing Full Remove: toMap stale")
+  eq(incremental.block_status(mod_blocks.toString, mod_fields), "stale", "Update Existing Full Remove: toString stale")
+  eq(incremental.block_status(mod_blocks.equality, mod_fields), "stale", "Update Existing Full Remove: equality stale")
+  eq(incremental.block_status(mod_blocks.hashCode, mod_fields), "stale", "Update Existing Full Remove: hashCode stale")
+
+  -- Apply update existing
+  local new_lines, new_text, edit_count = apply_update_existing(mod_lines, "Product")
+  ok(edit_count > 0, "Update Existing Full Remove: edits produced")
+
+  -- Verify quantity removed from all members
+  ok(not new_text:find("quantity"), "Update Existing Full Remove: 'quantity' removed from everywhere")
+  ok(new_text:find("this%.name"), "Update Existing Full Remove: name still in constructor")
+  ok(new_text:find("this%.price"), "Update Existing Full Remove: price still in constructor")
+  ok(new_text:find("name %?%? this%.name"), "Update Existing Full Remove: name in copyWith")
+  ok(new_text:find("price %?%? this%.price"), "Update Existing Full Remove: price in copyWith")
+
+  -- Verify toMap still has name and price
+  ok(new_text:find("'name': name"), "Update Existing Full Remove: toMap has name")
+  ok(new_text:find("'price': price"), "Update Existing Full Remove: toMap has price")
+
+  -- Idempotency
+  verify_idempotent(new_lines, new_text, "Product")
+end
+
+-- ===========================================================================
+-- Test 7: No existing members — update existing does nothing
+-- ===========================================================================
+io.write("\n--- Update Existing: no existing members (no-op) ---\n")
+do
+  local text = [[class Empty {
+  final String name;
+  final int age;
+}
+]]
+  local lines = {}
+  for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+    lines[#lines + 1] = line
+  end
+
+  local _, _, edit_count = apply_update_existing(lines, "Empty")
+  eq(edit_count, 0, "Update Existing No Members: 0 edits (nothing to update)")
+end
+
+-- ===========================================================================
+-- Test 8: All members already in sync — no-op
+-- ===========================================================================
+io.write("\n--- Update Existing: all members in sync (no-op) ---\n")
+do
+  local text = [[class Synced {
+  final String name;
+  final int age;
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  local full_lines, full_text, _ = generate_all_incremental(clazz, lines)
+
+  -- Now run update existing on the already-complete class
+  local _, _, edit_count = apply_update_existing(full_lines, "Synced")
+  eq(edit_count, 0, "Update Existing All Synced: 0 edits (everything up to date)")
+end
+
+-- ===========================================================================
+-- Test 9: Only some members exist — update only those, create none
+-- ===========================================================================
+io.write("\n--- Update Existing: partial members, only existing updated ---\n")
+do
+  local text = [[class Partial {
+  final String name;
+  final int age;
+  final String email;
+
+  const Partial({
+    required this.name,
+    required this.age,
+  });
+
+  Map<String, dynamic> toMap() {
+    return {
+      'name': name,
+      'age': age,
+    };
+  }
+
+  @override
+  String toString() {
+    return 'Partial(name: $name, age: $age)';
+  }
+}
+]]
+  local lines = {}
+  for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+    lines[#lines + 1] = line
+  end
+
+  local new_lines, new_text, edit_count = apply_update_existing(lines, "Partial")
+  ok(edit_count > 0, "Update Existing Partial: edits produced")
+
+  -- Constructor should now have email
+  ok(new_text:find("required this.email"), "Update Existing Partial: constructor has email")
+  -- toMap should now have email
+  ok(new_text:find("'email': email"), "Update Existing Partial: toMap has email")
+  -- toString should now have email
+  ok(new_text:find("email: %$email"), "Update Existing Partial: toString has email")
+
+  -- copyWith, fromMap, equality, hashCode should NOT be created
+  ok(not new_text:find("copyWith"), "Update Existing Partial: no copyWith created")
+  ok(not new_text:find("fromMap"), "Update Existing Partial: no fromMap created")
+  ok(not new_text:find("operator =="), "Update Existing Partial: no equality created")
+  ok(not new_text:find("get hashCode"), "Update Existing Partial: no hashCode created")
+
+  -- Idempotency
+  local _, _, edit_count2 = apply_update_existing(new_lines, "Partial")
+  eq(edit_count2, 0, "Update Existing Partial: idempotent")
+end
+
+-- ===========================================================================
+-- Test 10: toJson/fromJson wrappers updated when toMap/fromMap updated
+-- ===========================================================================
+io.write("\n--- Update Existing: toJson/fromJson wrappers follow toMap/fromMap ---\n")
+do
+  local text = [[class Item {
+  final String name;
+  final double price;
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  -- Generate full data class
+  local full_lines, full_text, _ = generate_all_incremental(clazz, lines)
+  ok(full_text:find("toJson"), "Update Existing Wrappers: toJson exists")
+  ok(full_text:find("fromJson"), "Update Existing Wrappers: fromJson exists")
+
+  -- Remove price field
+  local modified = full_text:gsub("  final double price;\n", "")
+  local mod_lines = {}
+  for line in (modified .. "\n"):gmatch("([^\n]*)\n") do
+    mod_lines[#mod_lines + 1] = line
+  end
+
+  local new_lines, new_text, edit_count = apply_update_existing(mod_lines, "Item")
+  ok(edit_count > 0, "Update Existing Wrappers: edits produced")
+
+  -- price should be gone from all members
+  ok(not new_text:find("price"), "Update Existing Wrappers: 'price' removed everywhere")
+
+  -- toJson and fromJson should still exist (they were updated, not removed)
+  ok(new_text:find("toJson"), "Update Existing Wrappers: toJson still exists")
+  ok(new_text:find("fromJson"), "Update Existing Wrappers: fromJson still exists")
+
+  -- Idempotency
+  verify_idempotent(new_lines, new_text, "Item")
+end
+
+-- ===========================================================================
+-- Test 11: Named optional constructor brackets preserved ([ ])
+-- ===========================================================================
+io.write("\n--- Update Existing: optional positional brackets preserved ---\n")
+do
+  local text = [[class Opt {
+  final String a;
+  final int b;
+  final bool c;
+
+  const Opt([this.a = '', this.b = 0]);
+}
+]]
+  local lines = {}
+  for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+    lines[#lines + 1] = line
+  end
+
+  local new_lines, new_text, edit_count = apply_update_existing(lines, "Opt")
+  ok(edit_count > 0, "Update Existing Optional Positional: edits produced")
+
+  -- Should preserve [ ] optional positional style
+  ok(new_text:find("Opt%(%["), "Update Existing Optional Positional: has Opt([")
+  ok(new_text:find("this%.a"), "Update Existing Optional Positional: has this.a")
+  ok(new_text:find("this%.c"), "Update Existing Optional Positional: has this.c")
+
+  -- Idempotency
+  local _, _, edit_count2 = apply_update_existing(new_lines, "Opt")
+  eq(edit_count2, 0, "Update Existing Optional Positional: idempotent")
+end
+
+-- ===========================================================================
+-- Test 12: action_title for stale status
+-- ===========================================================================
+io.write("\n--- Unit: action_title stale status ---\n")
+do
+  -- We can't call action_title directly (it's local), but we can test
+  -- the statuses via get_all_statuses exported from actions module
+  local text = [[class StaleTest {
+  final String name;
+
+  const StaleTest({
+    required this.name,
+    required this.age,
+  });
+}
+]]
+  local lines = {}
+  for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+    lines[#lines + 1] = line
+  end
+  local clazz = parser.find_class_by_name(parser.parse_classes(text), "StaleTest")
+  local blocks = incremental.detect_blocks(clazz, lines)
+  local statuses = actions.get_all_statuses(clazz, blocks)
+  eq(statuses.constructor, "stale", "action_title stale: constructor status is stale")
+end
+
+-- ===========================================================================
+-- Test 13: Multiple classes — update existing only affects targeted class
+-- ===========================================================================
+io.write("\n--- Update Existing: multiple classes isolation ---\n")
+do
+  local text = [[class Alpha {
+  final String x;
+
+  const Alpha({required this.x, required this.y});
+}
+
+class Beta {
+  final int a;
+  final int b;
+
+  const Beta({required this.a, required this.b});
+}
+]]
+  local lines = {}
+  for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+    lines[#lines + 1] = line
+  end
+
+  -- Only Alpha is stale (has orphan 'y'), Beta is complete
+  local new_lines, new_text, edit_count = apply_update_existing(lines, "Alpha")
+  ok(edit_count > 0, "Update Existing Multi-class: Alpha edits produced")
+
+  -- Alpha constructor should no longer have y
+  local alpha_clazz = parser.find_class_by_name(parser.parse_classes(new_text), "Alpha")
+  local alpha_blocks = incremental.detect_blocks(alpha_clazz, new_lines)
+  ok(not alpha_blocks.constructor.text:find("this%.y"), "Update Existing Multi-class: Alpha constructor no longer has y")
+
+  -- Beta should be unchanged
+  local beta_clazz = parser.find_class_by_name(parser.parse_classes(new_text), "Beta")
+  local beta_blocks = incremental.detect_blocks(beta_clazz, new_lines)
+  ok(beta_blocks.constructor.text:find("this%.a"), "Update Existing Multi-class: Beta constructor still has a")
+  ok(beta_blocks.constructor.text:find("this%.b"), "Update Existing Multi-class: Beta constructor still has b")
+end
+
+--------------------------------------------------------------------------------
 -- Summary
 --------------------------------------------------------------------------------
 io.write("\n==========================================\n")
