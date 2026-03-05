@@ -208,6 +208,24 @@ local function extract_hashcode_fields(text)
   return fields
 end
 
+--- Extract field names from Equatable props getter: "get props => [field1, field2];"
+---@param text string
+---@return string[]
+local function extract_props_fields(text)
+  local fields = {}
+  local seen = {}
+  -- Match the array content inside [ ... ]
+  local array_content = text:match("%[(.-)%]")
+  if not array_content then return fields end
+  for name in array_content:gmatch("([%w_]+)") do
+    if not seen[name] then
+      seen[name] = true
+      fields[#fields + 1] = name
+    end
+  end
+  return fields
+end
+
 --- Detect all method blocks within a class.
 ---@param clazz DartClass
 ---@param buf_lines string[] 1-indexed array of all buffer lines
@@ -433,6 +451,29 @@ function M.detect_blocks(clazz, buf_lines)
       goto continue
     end
 
+    -- props (has @override) — Equatable props getter
+    if has_override and check_line:match("List<Object%?>%s+get%s+props") then
+      local sig_line_idx = block_start + 1
+      while sig_line_idx <= stop and utils.trim(buf_lines[sig_line_idx]) == "" do
+        sig_line_idx = sig_line_idx + 1
+      end
+      local end_line = find_method_end(buf_lines, sig_line_idx)
+      local text_lines = {}
+      for j = block_start, end_line do
+        text_lines[#text_lines + 1] = buf_lines[j]
+      end
+      local text = table.concat(text_lines, "\n")
+      blocks.props = {
+        kind = "props",
+        start_line = block_start,
+        end_line = end_line,
+        fields = extract_props_fields(text),
+        text = text,
+      }
+      i = end_line + 1
+      goto continue
+    end
+
     i = i + 1
     ::continue::
   end
@@ -548,6 +589,28 @@ function M.wrapper_status(block)
   return "complete"
 end
 
+--- Determine the status of a props block.
+--- Like block_status but also checks field ORDER (props must match field order exactly).
+--- "absent"     — block does not exist
+--- "stale"      — block exists but fields mismatch (wrong set or wrong order)
+--- "complete"   — block exists, fields match exactly in order
+---@param block MethodBlock|nil
+---@param class_fields string[]
+---@return BlockStatus
+function M.props_status(block, class_fields)
+  if not block then return "absent" end
+  -- Check set membership first
+  local orphans = M.orphan_fields(class_fields, block.fields)
+  local missing = M.missing_fields(class_fields, block.fields)
+  if #orphans > 0 or #missing > 0 then return "stale" end
+  -- Check order
+  if #block.fields ~= #class_fields then return "stale" end
+  for i, name in ipairs(class_fields) do
+    if block.fields[i] ~= name then return "stale" end
+  end
+  return "complete"
+end
+
 --------------------------------------------------------------------------------
 -- Insertion point calculation
 --
@@ -560,7 +623,7 @@ end
 
 local METHOD_ORDER = {
   "constructor", "copyWith", "toMap", "fromMap", "toJson", "fromJson",
-  "toString", "equality", "hashCode",
+  "toString", "equality", "hashCode", "props",
 }
 
 --- Get the 1-indexed position in METHOD_ORDER for a given kind.
@@ -741,6 +804,7 @@ M.extract_frommap_fields = extract_frommap_fields
 M.extract_tostring_fields = extract_tostring_fields
 M.extract_equality_fields = extract_equality_fields
 M.extract_hashcode_fields = extract_hashcode_fields
+M.extract_props_fields = extract_props_fields
 M.find_method_end = find_method_end
 
 return M

@@ -509,6 +509,24 @@ function M.generate_to_string(clazz)
 end
 
 --------------------------------------------------------------------------------
+-- Equatable props
+--------------------------------------------------------------------------------
+
+---@param clazz DartClass
+---@return string
+function M.generate_props(clazz)
+  local props = clazz:gen_properties()
+  local fields = {}
+  for _, p in ipairs(props) do
+    fields[#fields + 1] = p.name
+  end
+
+  local method = "  @override\n"
+  method = method .. "  List<Object?> get props => [" .. table.concat(fields, ", ") .. "];"
+  return method
+end
+
+--------------------------------------------------------------------------------
 -- Equality (== and hashCode)
 --------------------------------------------------------------------------------
 

@@ -4613,6 +4613,997 @@ class Beta {
 end
 
 --------------------------------------------------------------------------------
+io.write("\n=== Equatable / Props Tests ===\n")
+--------------------------------------------------------------------------------
+
+-- ===========================================================================
+-- 1. Parser: uses_equatable() detection
+-- ===========================================================================
+io.write("\n--- Parser: uses_equatable() detection ---\n")
+
+-- extends Equatable
+do
+  local text = [[class Foo extends Equatable {
+  final String name;
+  final int age;
+}
+]]
+  local clazzes = parser.parse_classes(text)
+  local clazz = clazzes[1]
+  ok(clazz ~= nil, "uses_equatable: parsed extends Equatable class")
+  if clazz then
+    ok(clazz:uses_equatable(), "uses_equatable: extends Equatable returns true")
+  end
+end
+
+-- with EquatableMixin
+do
+  local text = [[class Bar with EquatableMixin {
+  final String title;
+  final double price;
+}
+]]
+  local clazzes = parser.parse_classes(text)
+  local clazz = clazzes[1]
+  ok(clazz ~= nil, "uses_equatable: parsed EquatableMixin class")
+  if clazz then
+    ok(clazz:uses_equatable(), "uses_equatable: with EquatableMixin returns true")
+  end
+end
+
+-- extends Equatable + other mixins
+do
+  local text = [[class Baz extends Equatable with SomeMixin {
+  final String data;
+}
+]]
+  local clazzes = parser.parse_classes(text)
+  local clazz = clazzes[1]
+  ok(clazz ~= nil, "uses_equatable: parsed extends Equatable with mixins")
+  if clazz then
+    ok(clazz:uses_equatable(), "uses_equatable: extends Equatable with mixins returns true")
+  end
+end
+
+-- regular class (NOT equatable)
+do
+  local text = [[class Regular {
+  final String name;
+}
+]]
+  local clazzes = parser.parse_classes(text)
+  local clazz = clazzes[1]
+  ok(clazz ~= nil, "uses_equatable: parsed regular class")
+  if clazz then
+    ok(not clazz:uses_equatable(), "uses_equatable: regular class returns false")
+  end
+end
+
+-- extends something else
+do
+  local text = [[class Child extends Parent {
+  final String name;
+}
+]]
+  local clazzes = parser.parse_classes(text)
+  local clazz = clazzes[1]
+  ok(clazz ~= nil, "uses_equatable: parsed extends Parent class")
+  if clazz then
+    ok(not clazz:uses_equatable(), "uses_equatable: extends Parent returns false")
+  end
+end
+
+-- ===========================================================================
+-- 2. Generator: generate_props() output correctness
+-- ===========================================================================
+io.write("\n--- Generator: generate_props() ---\n")
+
+-- Basic class with multiple fields
+do
+  local text = [[class Foo extends Equatable {
+  final String name;
+  final int age;
+  final String? email;
+}
+]]
+  local clazzes = parser.parse_classes(text)
+  local clazz = clazzes[1]
+  ok(clazz ~= nil, "generate_props: parsed class")
+  if clazz then
+    local props_text = generator.generate_props(clazz)
+    ok(props_text:find("@override", 1, true) ~= nil, "generate_props: has @override")
+    ok(props_text:find("List<Object?> get props", 1, true) ~= nil, "generate_props: has List<Object?> get props")
+    ok(props_text:find("[name, age, email]", 1, true) ~= nil, "generate_props: correct field list")
+    -- Check exact format
+    local expected = "  @override\n  List<Object?> get props => [name, age, email];"
+    eq(props_text, expected, "generate_props: exact output matches")
+  end
+end
+
+-- Single field
+do
+  local text = [[class Single extends Equatable {
+  final String name;
+}
+]]
+  local clazzes = parser.parse_classes(text)
+  local clazz = clazzes[1]
+  if clazz then
+    local props_text = generator.generate_props(clazz)
+    local expected = "  @override\n  List<Object?> get props => [name];"
+    eq(props_text, expected, "generate_props: single field")
+  end
+end
+
+-- No fields (empty props)
+do
+  local text = [[class Empty extends Equatable {
+}
+]]
+  local clazzes = parser.parse_classes(text)
+  local clazz = clazzes[1]
+  if clazz then
+    local props_text = generator.generate_props(clazz)
+    local expected = "  @override\n  List<Object?> get props => [];"
+    eq(props_text, expected, "generate_props: no fields produces empty array")
+  end
+end
+
+-- Excludes late fields (gen_properties() already does this)
+do
+  local text = [[class WithLate extends Equatable {
+  final String name;
+  late String derived;
+  final int count;
+}
+]]
+  local clazzes = parser.parse_classes(text)
+  local clazz = clazzes[1]
+  if clazz then
+    local props_text = generator.generate_props(clazz)
+    ok(props_text:find("name", 1, true) ~= nil, "generate_props late: includes name")
+    ok(props_text:find("count", 1, true) ~= nil, "generate_props late: includes count")
+    ok(props_text:find("derived", 1, true) == nil, "generate_props late: excludes late derived")
+  end
+end
+
+-- Excludes static fields
+do
+  local text = [[class WithStatic extends Equatable {
+  static const maxAge = 150;
+  final String name;
+  final int age;
+}
+]]
+  local clazzes = parser.parse_classes(text)
+  local clazz = clazzes[1]
+  if clazz then
+    local props_text = generator.generate_props(clazz)
+    ok(props_text:find("name", 1, true) ~= nil, "generate_props static: includes name")
+    ok(props_text:find("age", 1, true) ~= nil, "generate_props static: includes age")
+    ok(props_text:find("maxAge", 1, true) == nil, "generate_props static: excludes static maxAge")
+  end
+end
+
+-- ===========================================================================
+-- 3. Incremental: extract_props_fields()
+-- ===========================================================================
+io.write("\n--- Incremental: extract_props_fields() ---\n")
+
+do
+  -- Multiple fields
+  local fields = incremental.extract_props_fields("  @override\n  List<Object?> get props => [name, age, email];")
+  eq(#fields, 3, "extract_props_fields: 3 fields")
+  eq(fields[1], "name", "extract_props_fields: field 1 is name")
+  eq(fields[2], "age", "extract_props_fields: field 2 is age")
+  eq(fields[3], "email", "extract_props_fields: field 3 is email")
+
+  -- Empty array
+  local empty = incremental.extract_props_fields("  @override\n  List<Object?> get props => [];")
+  eq(#empty, 0, "extract_props_fields: empty array")
+
+  -- Single field
+  local single = incremental.extract_props_fields("  List<Object?> get props => [name];")
+  eq(#single, 1, "extract_props_fields: single field")
+  eq(single[1], "name", "extract_props_fields: single field is name")
+
+  -- No brackets at all
+  local none = incremental.extract_props_fields("some random text")
+  eq(#none, 0, "extract_props_fields: no brackets returns empty")
+
+  -- Whitespace inside brackets
+  local spaced = incremental.extract_props_fields("get props => [ name , age ];")
+  eq(#spaced, 2, "extract_props_fields: whitespace inside brackets")
+  eq(spaced[1], "name", "extract_props_fields: spaced field 1")
+  eq(spaced[2], "age", "extract_props_fields: spaced field 2")
+
+  -- Duplicate field names (edge case, should deduplicate)
+  local duped = incremental.extract_props_fields("get props => [name, name, age];")
+  eq(#duped, 2, "extract_props_fields: deduplicates")
+  eq(duped[1], "name", "extract_props_fields: dedup field 1")
+  eq(duped[2], "age", "extract_props_fields: dedup field 2")
+end
+
+-- ===========================================================================
+-- 4. Incremental: props block detection in detect_blocks()
+-- ===========================================================================
+io.write("\n--- Incremental: props block detection ---\n")
+
+-- Detect props in an Equatable class with existing props
+do
+  local text = [[class Foo extends Equatable {
+  final String name;
+  final int age;
+
+  @override
+  List<Object?> get props => [name, age];
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "props block detect: parsed class")
+  if clazz then
+    local blocks = incremental.detect_blocks(clazz, lines)
+    ok(blocks.props ~= nil, "props block detect: found props block")
+    if blocks.props then
+      eq(blocks.props.kind, "props", "props block detect: kind is 'props'")
+      eq(#blocks.props.fields, 2, "props block detect: 2 fields detected")
+      eq(blocks.props.fields[1], "name", "props block detect: field 1 is name")
+      eq(blocks.props.fields[2], "age", "props block detect: field 2 is age")
+      ok(blocks.props.text:find("@override", 1, true) ~= nil, "props block detect: text has @override")
+      ok(blocks.props.text:find("get props", 1, true) ~= nil, "props block detect: text has get props")
+    end
+  end
+end
+
+-- Bare Equatable class (no props getter)
+do
+  local text = [[class Bare extends Equatable {
+  final String name;
+  final int age;
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  if clazz then
+    local blocks = incremental.detect_blocks(clazz, lines)
+    eq(blocks.props, nil, "props block detect: bare Equatable has no props block")
+  end
+end
+
+-- Props getter with empty array
+do
+  local text = [[class EmptyProps extends Equatable {
+  @override
+  List<Object?> get props => [];
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  if clazz then
+    local blocks = incremental.detect_blocks(clazz, lines)
+    ok(blocks.props ~= nil, "props block detect: found empty props block")
+    if blocks.props then
+      eq(#blocks.props.fields, 0, "props block detect: empty array has 0 fields")
+    end
+  end
+end
+
+-- ===========================================================================
+-- 5. Incremental: props_status() — absent, stale, complete
+-- ===========================================================================
+io.write("\n--- Incremental: props_status() ---\n")
+
+-- absent
+do
+  eq(incremental.props_status(nil, {"name", "age"}), "absent", "props_status: nil block = absent")
+end
+
+-- complete (exact match, same order)
+do
+  local block = { fields = {"name", "age", "email"} }
+  eq(incremental.props_status(block, {"name", "age", "email"}), "complete", "props_status: same fields same order = complete")
+end
+
+-- stale: missing field
+do
+  local block = { fields = {"name", "age"} }
+  eq(incremental.props_status(block, {"name", "age", "email"}), "stale", "props_status: missing field = stale")
+end
+
+-- stale: extra field (orphan)
+do
+  local block = { fields = {"name", "age", "email"} }
+  eq(incremental.props_status(block, {"name", "age"}), "stale", "props_status: extra field = stale")
+end
+
+-- stale: wrong order (same set)
+do
+  local block = { fields = {"age", "name"} }
+  eq(incremental.props_status(block, {"name", "age"}), "stale", "props_status: wrong order = stale")
+end
+
+-- stale: different field entirely
+do
+  local block = { fields = {"name", "title"} }
+  eq(incremental.props_status(block, {"name", "age"}), "stale", "props_status: different field = stale")
+end
+
+-- complete: empty class, empty props
+do
+  local block = { fields = {} }
+  eq(incremental.props_status(block, {}), "complete", "props_status: both empty = complete")
+end
+
+-- stale: fields in props but no class fields
+do
+  local block = { fields = {"name"} }
+  eq(incremental.props_status(block, {}), "stale", "props_status: props has fields but class empty = stale")
+end
+
+-- ===========================================================================
+-- 6. Actions: applicable_kinds() for Equatable classes
+-- ===========================================================================
+io.write("\n--- Actions: applicable_kinds() for Equatable ---\n")
+
+-- Equatable class gets props instead of equality/hashCode
+do
+  local text = [[class Foo extends Equatable {
+  final String name;
+  final int age;
+}
+]]
+  local clazzes = parser.parse_classes(text)
+  local clazz = clazzes[1]
+  if clazz then
+    local kinds = actions.applicable_kinds(clazz)
+    ok(kinds.props == true, "applicable_kinds equatable: props = true")
+    ok(kinds.equality == nil, "applicable_kinds equatable: equality = nil")
+    ok(kinds.hashCode == nil, "applicable_kinds equatable: hashCode = nil")
+    ok(kinds.constructor == true, "applicable_kinds equatable: constructor = true")
+    ok(kinds.copyWith == true, "applicable_kinds equatable: copyWith = true")
+    ok(kinds.toMap == true, "applicable_kinds equatable: toMap = true")
+    ok(kinds.fromMap == true, "applicable_kinds equatable: fromMap = true")
+    ok(kinds.toJson == true, "applicable_kinds equatable: toJson = true")
+    ok(kinds.fromJson == true, "applicable_kinds equatable: fromJson = true")
+    ok(kinds.toString == true, "applicable_kinds equatable: toString = true")
+  end
+end
+
+-- Regular class gets equality/hashCode, NOT props
+do
+  local text = [[class Bar {
+  final String name;
+  final int age;
+}
+]]
+  local clazzes = parser.parse_classes(text)
+  local clazz = clazzes[1]
+  if clazz then
+    local kinds = actions.applicable_kinds(clazz)
+    ok(kinds.props == nil, "applicable_kinds regular: props = nil")
+    ok(kinds.equality == true, "applicable_kinds regular: equality = true")
+    ok(kinds.hashCode == true, "applicable_kinds regular: hashCode = true")
+  end
+end
+
+-- EquatableMixin class also gets props
+do
+  local text = [[class Baz with EquatableMixin {
+  final String name;
+}
+]]
+  local clazzes = parser.parse_classes(text)
+  local clazz = clazzes[1]
+  if clazz then
+    local kinds = actions.applicable_kinds(clazz)
+    ok(kinds.props == true, "applicable_kinds mixin: props = true")
+    ok(kinds.equality == nil, "applicable_kinds mixin: equality = nil")
+    ok(kinds.hashCode == nil, "applicable_kinds mixin: hashCode = nil")
+  end
+end
+
+-- ===========================================================================
+-- 7. Actions: get_all_statuses() for Equatable class
+-- ===========================================================================
+io.write("\n--- Actions: get_all_statuses() for Equatable ---\n")
+
+-- Bare Equatable class (nothing generated yet)
+do
+  local text = [[class Foo extends Equatable {
+  final String name;
+  final int age;
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  if clazz then
+    local blocks = incremental.detect_blocks(clazz, lines)
+    local statuses = actions.get_all_statuses(clazz, blocks)
+    eq(statuses.props, "absent", "get_all_statuses equatable bare: props = absent")
+    eq(statuses.constructor, "absent", "get_all_statuses equatable bare: constructor = absent")
+  end
+end
+
+-- Equatable with complete props
+do
+  local text = [[class Foo extends Equatable {
+  final String name;
+  final int age;
+
+  @override
+  List<Object?> get props => [name, age];
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  if clazz then
+    local blocks = incremental.detect_blocks(clazz, lines)
+    local statuses = actions.get_all_statuses(clazz, blocks)
+    eq(statuses.props, "complete", "get_all_statuses equatable complete: props = complete")
+  end
+end
+
+-- Equatable with stale props (missing field)
+do
+  local text = [[class Foo extends Equatable {
+  final String name;
+  final int age;
+  final String email;
+
+  @override
+  List<Object?> get props => [name, age];
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  if clazz then
+    local blocks = incremental.detect_blocks(clazz, lines)
+    local statuses = actions.get_all_statuses(clazz, blocks)
+    eq(statuses.props, "stale", "get_all_statuses equatable stale: props = stale (missing field)")
+  end
+end
+
+-- Equatable with stale props (wrong order)
+do
+  local text = [[class Foo extends Equatable {
+  final String name;
+  final int age;
+
+  @override
+  List<Object?> get props => [age, name];
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  if clazz then
+    local blocks = incremental.detect_blocks(clazz, lines)
+    local statuses = actions.get_all_statuses(clazz, blocks)
+    eq(statuses.props, "stale", "get_all_statuses equatable stale: props = stale (wrong order)")
+  end
+end
+
+-- ===========================================================================
+-- 8. Integration: Generate props for bare Equatable class
+-- ===========================================================================
+io.write("\n--- Integration: Generate props for bare Equatable ---\n")
+do
+  local text = [[class Foo extends Equatable {
+  final String name;
+  final int age;
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Integ props: parsed class")
+  if clazz then
+    -- Generate only props (simulating single action)
+    local gen_text = generator.generate_props(clazz)
+    local blocks = incremental.detect_blocks(clazz, lines)
+    local edit = incremental.build_edit("props", clazz, blocks, gen_text)
+    ok(edit ~= nil, "Integ props: edit produced")
+    if edit then
+      local new_lines = incremental.apply_edits(lines, { edit })
+      local new_text = table.concat(new_lines, "\n")
+      ok(new_text:find("@override", 1, true) ~= nil, "Integ props: has @override")
+      ok(new_text:find("List<Object?> get props => [name, age]", 1, true) ~= nil, "Integ props: has correct props getter")
+
+      -- Verify idempotency: second run should produce 0 edits
+      local r2_clazzes = parser.parse_classes(new_text)
+      local r2_clazz = parser.find_class_by_name(r2_clazzes, "Foo")
+      ok(r2_clazz ~= nil, "Integ props idempotent: re-parsed class")
+      if r2_clazz then
+        local r2_blocks = incremental.detect_blocks(r2_clazz, new_lines)
+        local r2_gen = generator.generate_props(r2_clazz)
+        local r2_edit = incremental.build_edit("props", r2_clazz, r2_blocks, r2_gen)
+        eq(r2_edit, nil, "Integ props idempotent: second run produces nil edit")
+      end
+    end
+  end
+end
+
+-- ===========================================================================
+-- 9. Integration: Update props when fields change
+-- ===========================================================================
+io.write("\n--- Integration: Update props on field change ---\n")
+
+-- Add a field to a class with existing props
+do
+  local text = [[class Foo extends Equatable {
+  final String name;
+  final int age;
+  final String email;
+
+  @override
+  List<Object?> get props => [name, age];
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Integ update props add: parsed class")
+  if clazz then
+    local gen_text = generator.generate_props(clazz)
+    local blocks = incremental.detect_blocks(clazz, lines)
+    local edit = incremental.build_edit("props", clazz, blocks, gen_text)
+    ok(edit ~= nil, "Integ update props add: edit produced")
+    if edit then
+      local new_lines = incremental.apply_edits(lines, { edit })
+      local new_text = table.concat(new_lines, "\n")
+      ok(new_text:find("[name, age, email]", 1, true) ~= nil, "Integ update props add: now includes email")
+
+      -- Idempotency
+      local r2_clazz = parser.find_class_by_name(parser.parse_classes(new_text), "Foo")
+      if r2_clazz then
+        local r2_blocks = incremental.detect_blocks(r2_clazz, new_lines)
+        local r2_gen = generator.generate_props(r2_clazz)
+        local r2_edit = incremental.build_edit("props", r2_clazz, r2_blocks, r2_gen)
+        eq(r2_edit, nil, "Integ update props add: idempotent after update")
+      end
+    end
+  end
+end
+
+-- Remove a field (props has orphan)
+do
+  local text = [[class Foo extends Equatable {
+  final String name;
+
+  @override
+  List<Object?> get props => [name, age];
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Integ update props remove: parsed class")
+  if clazz then
+    local gen_text = generator.generate_props(clazz)
+    local blocks = incremental.detect_blocks(clazz, lines)
+    local edit = incremental.build_edit("props", clazz, blocks, gen_text)
+    ok(edit ~= nil, "Integ update props remove: edit produced")
+    if edit then
+      local new_lines = incremental.apply_edits(lines, { edit })
+      local new_text = table.concat(new_lines, "\n")
+      ok(new_text:find("[name]", 1, true) ~= nil, "Integ update props remove: only name remains")
+      ok(new_text:find("age") == nil, "Integ update props remove: age is gone")
+    end
+  end
+end
+
+-- Reorder fields
+do
+  local text = [[class Foo extends Equatable {
+  final String name;
+  final int age;
+
+  @override
+  List<Object?> get props => [age, name];
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Integ update props reorder: parsed class")
+  if clazz then
+    local gen_text = generator.generate_props(clazz)
+    local blocks = incremental.detect_blocks(clazz, lines)
+    local edit = incremental.build_edit("props", clazz, blocks, gen_text)
+    ok(edit ~= nil, "Integ update props reorder: edit produced")
+    if edit then
+      local new_lines = incremental.apply_edits(lines, { edit })
+      local new_text = table.concat(new_lines, "\n")
+      ok(new_text:find("[name, age]", 1, true) ~= nil, "Integ update props reorder: correct order [name, age]")
+    end
+  end
+end
+
+-- ===========================================================================
+-- 10. Integration: Equatable + constructor + copyWith + toString + props
+-- ===========================================================================
+io.write("\n--- Integration: Full Equatable data class generation ---\n")
+do
+  local text = [[class Person extends Equatable {
+  final String name;
+  final int age;
+  final String? email;
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Integ full equatable: parsed class")
+  if clazz then
+    -- Equatable classes use: constructor, copyWith, toMap, fromMap, toJson, fromJson, toString, props
+    -- (NOT equality, hashCode)
+    local eq_kinds = { "constructor", "copyWith", "toMap", "fromMap", "toJson", "fromJson", "toString", "props" }
+    local blocks = incremental.detect_blocks(clazz, lines)
+    local edits = {}
+    for _, kind in ipairs(eq_kinds) do
+      local gen_text
+      if kind == "constructor" then
+        gen_text = generator.generate_constructor(clazz)
+      elseif kind == "copyWith" then
+        gen_text = (generator.generate_copy_with(clazz))
+      elseif kind == "toMap" then
+        gen_text = generator.generate_to_map(clazz)
+      elseif kind == "fromMap" then
+        gen_text = (generator.generate_from_map(clazz))
+      elseif kind == "toJson" then
+        gen_text = (generator.generate_to_json(clazz))
+      elseif kind == "fromJson" then
+        gen_text = (generator.generate_from_json(clazz))
+      elseif kind == "toString" then
+        gen_text = generator.generate_to_string(clazz)
+      elseif kind == "props" then
+        gen_text = generator.generate_props(clazz)
+      end
+      if gen_text then
+        local edit = incremental.build_edit(kind, clazz, blocks, gen_text)
+        if edit then
+          edits[#edits + 1] = edit
+        end
+      end
+    end
+    ok(#edits > 0, "Integ full equatable: edits produced")
+    local new_lines = incremental.apply_edits(lines, edits)
+    local new_text = table.concat(new_lines, "\n")
+
+    -- Should have constructor, copyWith, toMap, fromMap, toJson, fromJson, toString, props
+    ok(new_text:find("const Person({", 1, true) ~= nil, "Integ full equatable: has constructor")
+    ok(new_text:find("Person copyWith(", 1, true) ~= nil, "Integ full equatable: has copyWith")
+    ok(new_text:find("toMap", 1, true) ~= nil, "Integ full equatable: has toMap")
+    ok(new_text:find("fromMap", 1, true) ~= nil, "Integ full equatable: has fromMap")
+    ok(new_text:find("toJson", 1, true) ~= nil, "Integ full equatable: has toJson")
+    ok(new_text:find("fromJson", 1, true) ~= nil, "Integ full equatable: has fromJson")
+    ok(new_text:find("toString()", 1, true) ~= nil, "Integ full equatable: has toString")
+    ok(new_text:find("get props => [name, age, email]", 1, true) ~= nil, "Integ full equatable: has props")
+
+    -- Should NOT have equality or hashCode
+    ok(new_text:find("operator ==", 1, true) == nil, "Integ full equatable: no operator ==")
+    ok(new_text:find("get hashCode", 1, true) == nil, "Integ full equatable: no hashCode")
+
+    -- Verify idempotency
+    local r2_clazz = parser.find_class_by_name(parser.parse_classes(new_text), "Person")
+    ok(r2_clazz ~= nil, "Integ full equatable idempotent: re-parsed class")
+    if r2_clazz then
+      local r2_blocks = incremental.detect_blocks(r2_clazz, new_lines)
+      local r2_edits = 0
+      for _, kind in ipairs(eq_kinds) do
+        local gen_text
+        if kind == "constructor" then
+          gen_text = generator.generate_constructor(r2_clazz)
+        elseif kind == "copyWith" then
+          gen_text = (generator.generate_copy_with(r2_clazz))
+        elseif kind == "toMap" then
+          gen_text = generator.generate_to_map(r2_clazz)
+        elseif kind == "fromMap" then
+          gen_text = (generator.generate_from_map(r2_clazz))
+        elseif kind == "toJson" then
+          gen_text = (generator.generate_to_json(r2_clazz))
+        elseif kind == "fromJson" then
+          gen_text = (generator.generate_from_json(r2_clazz))
+        elseif kind == "toString" then
+          gen_text = generator.generate_to_string(r2_clazz)
+        elseif kind == "props" then
+          gen_text = generator.generate_props(r2_clazz)
+        end
+        if gen_text then
+          local e = incremental.build_edit(kind, r2_clazz, r2_blocks, gen_text)
+          if e then
+            r2_edits = r2_edits + 1
+            io.write("    [DEBUG] Non-idempotent edit for " .. kind .. " (action=" .. e.action .. ")\n")
+          end
+        end
+      end
+      eq(r2_edits, 0, "Integ full equatable idempotent: second run 0 edits")
+    end
+  end
+end
+
+-- ===========================================================================
+-- 11. Integration: EquatableMixin full generation
+-- ===========================================================================
+io.write("\n--- Integration: EquatableMixin full generation ---\n")
+do
+  local text = [[class Config with EquatableMixin {
+  final String key;
+  final String value;
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Integ mixin: parsed EquatableMixin class")
+  if clazz then
+    ok(clazz:uses_equatable(), "Integ mixin: uses_equatable returns true")
+    local gen_text = generator.generate_props(clazz)
+    local blocks = incremental.detect_blocks(clazz, lines)
+    local edit = incremental.build_edit("props", clazz, blocks, gen_text)
+    ok(edit ~= nil, "Integ mixin: props edit produced")
+    if edit then
+      local new_lines = incremental.apply_edits(lines, { edit })
+      local new_text = table.concat(new_lines, "\n")
+      ok(new_text:find("get props => [key, value]", 1, true) ~= nil, "Integ mixin: correct props getter")
+    end
+  end
+end
+
+-- ===========================================================================
+-- 12. Full Actions Integration: Equatable data class via simulated vim.api
+-- ===========================================================================
+io.write("\n--- Actions Integration: Equatable data class ---\n")
+do
+  -- Create a fake buffer that mimics vim.api behavior
+  local function make_fake_buffer_eq(initial_text)
+    local buf_lines = {}
+    for line in (initial_text .. "\n"):gmatch("([^\n]*)\n") do
+      buf_lines[#buf_lines + 1] = line
+    end
+
+    local bufnr = 998 -- fake buffer number
+    local notifications = {}
+
+    vim.api = vim.api or {}
+    vim.notify = function(msg, level)
+      notifications[#notifications + 1] = { msg = msg, level = level }
+    end
+
+    vim.api.nvim_buf_line_count = function(b)
+      if b == bufnr then return #buf_lines end
+      return 0
+    end
+
+    vim.api.nvim_buf_get_lines = function(b, start_idx, end_idx, strict)
+      if b ~= bufnr then return {} end
+      local result = {}
+      for i = start_idx + 1, end_idx do
+        result[#result + 1] = buf_lines[i] or ""
+      end
+      return result
+    end
+
+    vim.api.nvim_buf_set_lines = function(b, start_idx, end_idx, strict, replacement)
+      if b ~= bufnr then return end
+      local new_buf = {}
+      for i = 1, start_idx do
+        new_buf[#new_buf + 1] = buf_lines[i]
+      end
+      for _, l in ipairs(replacement) do
+        new_buf[#new_buf + 1] = l
+      end
+      for i = end_idx + 1, #buf_lines do
+        new_buf[#new_buf + 1] = buf_lines[i]
+      end
+      buf_lines = new_buf
+    end
+
+    return bufnr, buf_lines, notifications, function() return buf_lines end
+  end
+
+  local initial_text = [[class Person extends Equatable {
+  final String name;
+  final int age;
+}]]
+
+  local bufnr, _, notifications, get_buf = make_fake_buffer_eq(initial_text)
+
+  -- Step 1: Get code actions for the Equatable class
+  local person_actions = actions.get_code_actions(bufnr, 1)
+  ok(#person_actions > 0, "ActionsInteg Equatable: has code actions")
+
+  -- Should have "data class" action
+  local dc_action
+  for _, a in ipairs(person_actions) do
+    if a.title:find("data class", 1, true) then
+      dc_action = a
+      break
+    end
+  end
+  ok(dc_action ~= nil, "ActionsInteg Equatable: has data class action")
+
+  -- Should have "Add props" action
+  local props_action
+  for _, a in ipairs(person_actions) do
+    if a.title == "Add props" then
+      props_action = a
+      break
+    end
+  end
+  ok(props_action ~= nil, "ActionsInteg Equatable: has 'Add props' action")
+
+  -- Should NOT have equality or hashCode actions
+  local has_equality, has_hashcode = false, false
+  for _, a in ipairs(person_actions) do
+    if a.title:find("equality", 1, true) then has_equality = true end
+    if a.title:find("hashCode", 1, true) then has_hashcode = true end
+  end
+  ok(not has_equality, "ActionsInteg Equatable: no equality action")
+  ok(not has_hashcode, "ActionsInteg Equatable: no hashCode action")
+
+  -- Should have constructor, copyWith, toString actions
+  local has_ctor, has_cw, has_tostr = false, false, false
+  for _, a in ipairs(person_actions) do
+    if a.title:find("constructor", 1, true) then has_ctor = true end
+    if a.title:find("copyWith", 1, true) then has_cw = true end
+    if a.title:find("toString", 1, true) then has_tostr = true end
+  end
+  ok(has_ctor, "ActionsInteg Equatable: has constructor action")
+  ok(has_cw, "ActionsInteg Equatable: has copyWith action")
+  ok(has_tostr, "ActionsInteg Equatable: has toString action")
+
+  if dc_action then
+    -- Execute the data class action
+    actions.execute_action(dc_action)
+
+    local buf_after = get_buf()
+    local text_after = table.concat(buf_after, "\n")
+
+    -- Should have props getter
+    ok(text_after:find("get props => [name, age]", 1, true) ~= nil, "ActionsInteg Equatable: generated props getter")
+    -- Should have constructor
+    ok(text_after:find("this.name", 1, true) ~= nil, "ActionsInteg Equatable: generated constructor")
+    -- Should NOT have equality/hashCode
+    ok(text_after:find("operator ==", 1, true) == nil, "ActionsInteg Equatable: no operator ==")
+    ok(text_after:find("get hashCode", 1, true) == nil, "ActionsInteg Equatable: no hashCode")
+
+    -- Now add a field and verify "Update props" action appears
+    -- Simulate adding email field
+    local modified_text = text_after:gsub(
+      "  final int age;",
+      "  final int age;\n  final String? email;"
+    )
+    -- Update buf_lines
+    local mod_lines = {}
+    for line in (modified_text .. "\n"):gmatch("([^\n]*)\n") do
+      mod_lines[#mod_lines + 1] = line
+    end
+    -- Manually set buf_lines
+    vim.api.nvim_buf_set_lines(bufnr, 0, #buf_after, false, mod_lines)
+
+    -- Find the Person class line (may have shifted due to imports)
+    local mod_buf = get_buf()
+    local person_line_2 = 1
+    for i, l in ipairs(mod_buf) do
+      if l:match("^class Person") then
+        person_line_2 = i
+        break
+      end
+    end
+
+    local person_actions_2 = actions.get_code_actions(bufnr, person_line_2)
+    local update_props_action
+    for _, a in ipairs(person_actions_2) do
+      if a.title == "Update props" then
+        update_props_action = a
+        break
+      end
+    end
+    ok(update_props_action ~= nil, "ActionsInteg Equatable: 'Update props' action after adding field")
+
+    -- Should also have "Update" actions for other stale methods
+    local has_update_ctor = false
+    for _, a in ipairs(person_actions_2) do
+      if a.title:find("Update constructor", 1, true) then has_update_ctor = true end
+    end
+    ok(has_update_ctor, "ActionsInteg Equatable: 'Update constructor' after adding field")
+  end
+
+  -- Clean up
+  vim.api = nil
+  vim.notify = nil
+end
+
+-- ===========================================================================
+-- 13. Edge case: Equatable class with no fields
+-- ===========================================================================
+io.write("\n--- Edge case: Equatable with no fields ---\n")
+do
+  local text = [[class Marker extends Equatable {
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Edge empty equatable: parsed class")
+  if clazz then
+    ok(clazz:uses_equatable(), "Edge empty equatable: uses_equatable true")
+    local gen_text = generator.generate_props(clazz)
+    local expected = "  @override\n  List<Object?> get props => [];"
+    eq(gen_text, expected, "Edge empty equatable: generates empty props")
+
+    local blocks = incremental.detect_blocks(clazz, lines)
+    local edit = incremental.build_edit("props", clazz, blocks, gen_text)
+    ok(edit ~= nil, "Edge empty equatable: edit produced for empty props")
+    if edit then
+      local new_lines = incremental.apply_edits(lines, { edit })
+      local new_text = table.concat(new_lines, "\n")
+      ok(new_text:find("get props => []", 1, true) ~= nil, "Edge empty equatable: empty props inserted")
+    end
+  end
+end
+
+-- ===========================================================================
+-- 14. Edge case: props getter ordering within class body
+-- ===========================================================================
+io.write("\n--- Edge case: props position in class body ---\n")
+do
+  -- Props should be inserted after toString (which is after hashCode in METHOD_ORDER,
+  -- but since Equatable class won't have equality/hashCode, it goes after toString)
+  local text = [[class Foo extends Equatable {
+  final String name;
+  final int age;
+
+  const Foo({
+    required this.name,
+    required this.age,
+  });
+
+  @override
+  String toString() =>
+      'Foo(name: $name, age: $age)';
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Edge props position: parsed class")
+  if clazz then
+    local gen_text = generator.generate_props(clazz)
+    local blocks = incremental.detect_blocks(clazz, lines)
+    local edit = incremental.build_edit("props", clazz, blocks, gen_text)
+    ok(edit ~= nil, "Edge props position: edit produced")
+    if edit then
+      local new_lines = incremental.apply_edits(lines, { edit })
+      local new_text = table.concat(new_lines, "\n")
+      ok(new_text:find("get props", 1, true) ~= nil, "Edge props position: props present")
+
+      -- Props should be after toString
+      local tostr_pos = new_text:find("toString()", 1, true)
+      local props_pos = new_text:find("get props", 1, true)
+      ok(props_pos > tostr_pos, "Edge props position: props after toString")
+    end
+  end
+end
+
+-- ===========================================================================
+-- 15. Equatable + Regular class in same file
+-- ===========================================================================
+io.write("\n--- Multi-class: Equatable + Regular in same file ---\n")
+do
+  local text = [[class EqClass extends Equatable {
+  final String name;
+  final int age;
+}
+
+class RegClass {
+  final String title;
+  final double price;
+}
+]]
+  local clazzes = parser.parse_classes(text)
+  local eq_clazz, reg_clazz
+  for _, c in ipairs(clazzes) do
+    if c.name == "EqClass" then eq_clazz = c end
+    if c.name == "RegClass" then reg_clazz = c end
+  end
+
+  ok(eq_clazz ~= nil, "Multi eq+reg: parsed EqClass")
+  ok(reg_clazz ~= nil, "Multi eq+reg: parsed RegClass")
+
+  if eq_clazz and reg_clazz then
+    local eq_kinds = actions.applicable_kinds(eq_clazz)
+    local reg_kinds = actions.applicable_kinds(reg_clazz)
+
+    ok(eq_kinds.props == true, "Multi eq+reg: EqClass has props")
+    ok(eq_kinds.equality == nil, "Multi eq+reg: EqClass no equality")
+    ok(eq_kinds.hashCode == nil, "Multi eq+reg: EqClass no hashCode")
+
+    ok(reg_kinds.props == nil, "Multi eq+reg: RegClass no props")
+    ok(reg_kinds.equality == true, "Multi eq+reg: RegClass has equality")
+    ok(reg_kinds.hashCode == true, "Multi eq+reg: RegClass has hashCode")
+  end
+end
+
+--------------------------------------------------------------------------------
 -- Summary
 --------------------------------------------------------------------------------
 io.write("\n==========================================\n")

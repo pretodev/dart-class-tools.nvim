@@ -11,7 +11,7 @@ local M = {}
 --- The canonical order of method kinds that form a "data class".
 local ALL_KINDS = {
   "constructor", "copyWith", "toMap", "fromMap", "toJson", "fromJson",
-  "toString", "equality", "hashCode",
+  "toString", "equality", "hashCode", "props",
 }
 
 --- Which kinds have field-level tracking (so we can detect incomplete blocks).
@@ -23,6 +23,7 @@ local FIELD_TRACKED = {
   toString = true,
   equality = true,
   hashCode = true,
+  props = true,
 }
 
 --- Determine which kinds are applicable for a given class.
@@ -30,6 +31,7 @@ local FIELD_TRACKED = {
 ---@return table<string, boolean>
 local function applicable_kinds(clazz)
   local kinds = { constructor = true }
+  local uses_equatable = clazz:uses_equatable()
 
   if clazz:is_widget() then
     -- Widgets only get constructor
@@ -50,8 +52,14 @@ local function applicable_kinds(clazz)
   end
 
   kinds.toString = true
-  kinds.equality = true
-  kinds.hashCode = true
+
+  if uses_equatable then
+    -- Equatable classes use props instead of manual == and hashCode
+    kinds.props = true
+  else
+    kinds.equality = true
+    kinds.hashCode = true
+  end
 
   return kinds
 end
@@ -67,6 +75,8 @@ local function get_all_statuses(clazz, blocks)
   for _, kind in ipairs(ALL_KINDS) do
     if kind == "toJson" or kind == "fromJson" then
       statuses[kind] = incremental.wrapper_status(blocks[kind])
+    elseif kind == "props" then
+      statuses[kind] = incremental.props_status(blocks[kind], class_fields)
     elseif FIELD_TRACKED[kind] then
       statuses[kind] = incremental.block_status(blocks[kind], class_fields)
     else
@@ -91,9 +101,18 @@ local function action_title(kind, status)
     fromJson = "fromJson",
     toString = "toString",
     equality = "equality (== & hashCode)",
+    props = "props",
     dataClass = "data class",
   }
   local name = names[kind] or kind
+
+  if kind == "props" then
+    if status == "absent" then
+      return "Add " .. name
+    else
+      return "Update " .. name
+    end
+  end
 
   if status == "incomplete" then
     return "Update " .. name .. " (add missing fields)"
@@ -154,6 +173,8 @@ local function generate_kind(clazz, kind)
     local t, imps = generator.generate_hash_code(clazz)
     text = t
     imports = imps or {}
+  elseif kind == "props" then
+    text = generator.generate_props(clazz)
   end
 
   return text, imports
