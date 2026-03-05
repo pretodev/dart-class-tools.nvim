@@ -29,6 +29,7 @@ package.path = root .. "lua/?.lua;" .. root .. "lua/?/init.lua;" .. package.path
 local utils = require("dart-class-tools.utils")
 local parser = require("dart-class-tools.parser")
 local generator = require("dart-class-tools.generator")
+local incremental = require("dart-class-tools.incremental")
 
 --------------------------------------------------------------------------------
 -- Test infrastructure
@@ -893,6 +894,857 @@ if with_constr then
       end
     end
     eq(constr_count, 1, "Edge: WithConstructor has exactly 1 constructor (no duplicate)")
+  end
+end
+
+--------------------------------------------------------------------------------
+-- Incremental module tests
+--------------------------------------------------------------------------------
+io.write("\n=== Incremental: Field Extraction Tests ===\n")
+
+-- extract_this_fields
+do
+  local text = [[
+  const User({
+    required this.name,
+    required this.age,
+    this.email,
+    required this.isActive,
+  });]]
+  local fields = incremental.extract_this_fields(text)
+  eq(#fields, 4, "extract_this_fields: User constructor has 4 fields")
+  eq(fields[1], "name", "extract_this_fields: first is name")
+  eq(fields[2], "age", "extract_this_fields: second is age")
+  eq(fields[3], "email", "extract_this_fields: third is email")
+  eq(fields[4], "isActive", "extract_this_fields: fourth is isActive")
+
+  -- No duplicates
+  local text2 = "  Foo({required this.x, required this.x});"
+  local f2 = incremental.extract_this_fields(text2)
+  eq(#f2, 1, "extract_this_fields: deduplicates")
+end
+
+-- extract_copywith_fields
+do
+  local text = [[
+  User copyWith({String? name, int? age, String? email, bool? isActive}) {
+    return User(
+      name: name ?? this.name,
+      age: age ?? this.age,
+      email: email ?? this.email,
+      isActive: isActive ?? this.isActive,
+    );
+  }]]
+  local fields = incremental.extract_copywith_fields(text)
+  eq(#fields, 4, "extract_copywith_fields: User has 4 fields")
+  eq(fields[1], "name", "extract_copywith_fields: first is name")
+  eq(fields[4], "isActive", "extract_copywith_fields: last is isActive")
+end
+
+-- extract_tomap_fields
+do
+  local text = [[
+  Map<String, dynamic> toMap() {
+    return {'name': name, 'age': age, 'email': email, 'isActive': isActive};
+  }]]
+  local fields = incremental.extract_tomap_fields(text)
+  eq(#fields, 4, "extract_tomap_fields: User has 4 fields")
+  eq(fields[1], "name", "extract_tomap_fields: first is name")
+end
+
+-- extract_frommap_fields
+do
+  local text = [[
+  factory User.fromMap(Map<String, dynamic> map) {
+    return User(
+      name: map['name'] as String,
+      age: map['age'] as int,
+      email: map['email'] as String?,
+      isActive: map['isActive'] as bool,
+    );
+  }]]
+  local fields = incremental.extract_frommap_fields(text)
+  -- fromMap extracts both named param keys and map['key'] keys, deduplicating
+  ok(#fields >= 4, "extract_frommap_fields: User has >= 4 fields")
+  -- Check that key fields are present
+  local fset = {}
+  for _, f in ipairs(fields) do fset[f] = true end
+  ok(fset["name"], "extract_frommap_fields: has name")
+  ok(fset["age"], "extract_frommap_fields: has age")
+  ok(fset["email"], "extract_frommap_fields: has email")
+  ok(fset["isActive"], "extract_frommap_fields: has isActive")
+end
+
+-- extract_tostring_fields
+do
+  local text = "  @override\n  String toString() =>\n      'User(name: $name, age: $age, email: $email, isActive: $isActive)';"
+  local fields = incremental.extract_tostring_fields(text)
+  eq(#fields, 4, "extract_tostring_fields: User has 4 fields")
+  eq(fields[1], "name", "extract_tostring_fields: first is name")
+end
+
+-- extract_equality_fields
+do
+  local text = [[
+  @override
+  bool operator ==(Object other) {
+    if (identical(this, other)) return true;
+
+    return other is User &&
+        other.name == name &&
+        other.age == age &&
+        other.email == email &&
+        other.isActive == isActive;
+  }]]
+  local fields = incremental.extract_equality_fields(text)
+  eq(#fields, 4, "extract_equality_fields: User has 4 fields")
+  eq(fields[1], "name", "extract_equality_fields: first is name")
+end
+
+-- extract_hashcode_fields
+do
+  local text = "  @override\n  int get hashCode =>\n      name.hashCode ^ age.hashCode ^ email.hashCode ^ isActive.hashCode;"
+  local fields = incremental.extract_hashcode_fields(text)
+  eq(#fields, 4, "extract_hashcode_fields: User has 4 fields")
+  eq(fields[1], "name", "extract_hashcode_fields: first is name")
+end
+
+--------------------------------------------------------------------------------
+io.write("\n=== Incremental: Block Detection Tests ===\n")
+
+-- Test block detection on the expected_user.dart (fully generated class)
+do
+  local user_full_text = read_file(fixtures_dir .. "expected_user.dart")
+  local full_lines = {}
+  for line in (user_full_text .. "\n"):gmatch("([^\n]*)\n") do
+    full_lines[#full_lines + 1] = line
+  end
+
+  local full_clazzes = parser.parse_classes(user_full_text)
+  local full_user
+  for _, c in ipairs(full_clazzes) do
+    if c.name == "User" then full_user = c; break end
+  end
+  ok(full_user ~= nil, "Block detect: parsed User from expected_user.dart")
+
+  if full_user then
+    local blocks = incremental.detect_blocks(full_user, full_lines)
+
+    -- Constructor
+    ok(blocks.constructor ~= nil, "Block detect: found constructor")
+    if blocks.constructor then
+      eq(blocks.constructor.kind, "constructor", "Block detect: constructor kind")
+      eq(#blocks.constructor.fields, 4, "Block detect: constructor has 4 fields")
+    end
+
+    -- copyWith
+    ok(blocks.copyWith ~= nil, "Block detect: found copyWith")
+    if blocks.copyWith then
+      eq(#blocks.copyWith.fields, 4, "Block detect: copyWith has 4 fields")
+    end
+
+    -- toMap
+    ok(blocks.toMap ~= nil, "Block detect: found toMap")
+    if blocks.toMap then
+      eq(#blocks.toMap.fields, 4, "Block detect: toMap has 4 fields")
+    end
+
+    -- fromMap
+    ok(blocks.fromMap ~= nil, "Block detect: found fromMap")
+    if blocks.fromMap then
+      ok(#blocks.fromMap.fields >= 4, "Block detect: fromMap has >= 4 fields")
+    end
+
+    -- toJson
+    ok(blocks.toJson ~= nil, "Block detect: found toJson")
+
+    -- fromJson
+    ok(blocks.fromJson ~= nil, "Block detect: found fromJson")
+
+    -- toString
+    ok(blocks.toString ~= nil, "Block detect: found toString")
+    if blocks.toString then
+      eq(#blocks.toString.fields, 4, "Block detect: toString has 4 fields")
+    end
+
+    -- equality
+    ok(blocks.equality ~= nil, "Block detect: found equality")
+    if blocks.equality then
+      eq(#blocks.equality.fields, 4, "Block detect: equality has 4 fields")
+    end
+
+    -- hashCode
+    ok(blocks.hashCode ~= nil, "Block detect: found hashCode")
+    if blocks.hashCode then
+      eq(#blocks.hashCode.fields, 4, "Block detect: hashCode has 4 fields")
+    end
+  end
+end
+
+-- Test block detection on bare class (no methods)
+do
+  local bare_text = "class Bare {\n  final String name;\n  final int age;\n}\n"
+  local bare_lines = {}
+  for line in (bare_text .. "\n"):gmatch("([^\n]*)\n") do
+    bare_lines[#bare_lines + 1] = line
+  end
+
+  local bare_clazzes = parser.parse_classes(bare_text)
+  local bare_class = bare_clazzes[1]
+  ok(bare_class ~= nil, "Block detect bare: parsed class")
+
+  if bare_class then
+    local blocks = incremental.detect_blocks(bare_class, bare_lines)
+    eq(blocks.constructor, nil, "Block detect bare: no constructor")
+    eq(blocks.copyWith, nil, "Block detect bare: no copyWith")
+    eq(blocks.toMap, nil, "Block detect bare: no toMap")
+    eq(blocks.fromMap, nil, "Block detect bare: no fromMap")
+    eq(blocks.toJson, nil, "Block detect bare: no toJson")
+    eq(blocks.fromJson, nil, "Block detect bare: no fromJson")
+    eq(blocks.toString, nil, "Block detect bare: no toString")
+    eq(blocks.equality, nil, "Block detect bare: no equality")
+    eq(blocks.hashCode, nil, "Block detect bare: no hashCode")
+  end
+end
+
+-- Test block detection with partial methods (only constructor + toString)
+do
+  local partial_text = [[class Partial {
+  final String name;
+  final int age;
+
+  const Partial({
+    required this.name,
+    required this.age,
+  });
+
+  @override
+  String toString() =>
+      'Partial(name: $name, age: $age)';
+}
+]]
+  local partial_lines = {}
+  for line in (partial_text .. "\n"):gmatch("([^\n]*)\n") do
+    partial_lines[#partial_lines + 1] = line
+  end
+
+  local partial_clazzes = parser.parse_classes(partial_text)
+  local partial_class = partial_clazzes[1]
+  ok(partial_class ~= nil, "Block detect partial: parsed class")
+
+  if partial_class then
+    local blocks = incremental.detect_blocks(partial_class, partial_lines)
+    ok(blocks.constructor ~= nil, "Block detect partial: found constructor")
+    ok(blocks.toString ~= nil, "Block detect partial: found toString")
+    eq(blocks.copyWith, nil, "Block detect partial: no copyWith")
+    eq(blocks.toMap, nil, "Block detect partial: no toMap")
+    eq(blocks.equality, nil, "Block detect partial: no equality")
+    eq(blocks.hashCode, nil, "Block detect partial: no hashCode")
+  end
+end
+
+--------------------------------------------------------------------------------
+io.write("\n=== Incremental: Field Comparison & Status Tests ===\n")
+
+-- missing_fields
+do
+  local missing = incremental.missing_fields({"a", "b", "c"}, {"a", "c"})
+  eq(#missing, 1, "missing_fields: 1 missing")
+  eq(missing[1], "b", "missing_fields: missing field is 'b'")
+
+  local none = incremental.missing_fields({"a", "b"}, {"a", "b"})
+  eq(#none, 0, "missing_fields: nothing missing")
+
+  local all = incremental.missing_fields({"a", "b"}, {})
+  eq(#all, 2, "missing_fields: all missing when existing is empty")
+end
+
+-- fields_match
+do
+  ok(incremental.fields_match({"a", "b"}, {"b", "a"}), "fields_match: same set different order")
+  ok(incremental.fields_match({}, {}), "fields_match: both empty")
+  ok(not incremental.fields_match({"a"}, {"a", "b"}), "fields_match: different sizes")
+  ok(not incremental.fields_match({"a", "c"}, {"a", "b"}), "fields_match: different elements")
+end
+
+-- get_class_field_names
+do
+  if user_class then
+    local names = incremental.get_class_field_names(user_class)
+    eq(#names, 4, "get_class_field_names: User has 4 gen fields")
+    eq(names[1], "name", "get_class_field_names: first is name")
+  end
+end
+
+-- block_status
+do
+  -- absent
+  eq(incremental.block_status(nil, {"a", "b"}), "absent", "block_status: nil block = absent")
+
+  -- complete
+  local complete_block = { fields = {"a", "b", "c"} }
+  eq(incremental.block_status(complete_block, {"a", "b", "c"}), "complete", "block_status: all fields = complete")
+
+  -- incomplete
+  local incomplete_block = { fields = {"a", "c"} }
+  eq(incremental.block_status(incomplete_block, {"a", "b", "c"}), "incomplete", "block_status: missing field = incomplete")
+end
+
+-- wrapper_status
+do
+  eq(incremental.wrapper_status(nil), "absent", "wrapper_status: nil = absent")
+  eq(incremental.wrapper_status({ fields = {} }), "complete", "wrapper_status: present = complete")
+end
+
+--------------------------------------------------------------------------------
+io.write("\n=== Incremental: Insert Point Tests ===\n")
+
+-- Test find_insert_point on bare class
+do
+  local bare_text = "class Bare {\n  final String name;\n  final int age;\n}\n"
+  local bare_lines = {}
+  for line in (bare_text .. "\n"):gmatch("([^\n]*)\n") do
+    bare_lines[#bare_lines + 1] = line
+  end
+  local bare_clazzes = parser.parse_classes(bare_text)
+  local bare_class = bare_clazzes[1]
+
+  if bare_class then
+    local blocks = {}
+    -- Constructor should insert after last property
+    local insert_pt = incremental.find_insert_point(bare_class, blocks, "constructor")
+    eq(insert_pt, bare_class:props_end_at_line(), "find_insert_point: constructor goes after props")
+
+    -- copyWith should also go after props when no constructor block detected
+    local insert_cw = incremental.find_insert_point(bare_class, blocks, "copyWith")
+    eq(insert_cw, bare_class:props_end_at_line(), "find_insert_point: copyWith after props (no constr block)")
+  end
+end
+
+-- Test find_insert_point with some blocks present
+do
+  local user_full_text = read_file(fixtures_dir .. "expected_user.dart")
+  local full_lines = {}
+  for line in (user_full_text .. "\n"):gmatch("([^\n]*)\n") do
+    full_lines[#full_lines + 1] = line
+  end
+
+  local full_clazzes = parser.parse_classes(user_full_text)
+  local full_user
+  for _, c in ipairs(full_clazzes) do
+    if c.name == "User" then full_user = c; break end
+  end
+
+  if full_user then
+    local blocks = incremental.detect_blocks(full_user, full_lines)
+
+    -- toString should insert after fromJson
+    if blocks.fromJson then
+      local pt = incremental.find_insert_point(full_user, blocks, "toString")
+      ok(pt >= blocks.fromJson.end_line, "find_insert_point: toString after fromJson")
+    end
+
+    -- equality should insert after toString
+    if blocks.toString then
+      local pt = incremental.find_insert_point(full_user, blocks, "equality")
+      ok(pt >= blocks.toString.end_line, "find_insert_point: equality after toString")
+    end
+  end
+end
+
+--------------------------------------------------------------------------------
+io.write("\n=== Incremental: Build Edit Tests ===\n")
+
+-- build_edit: idempotency (identical text returns nil)
+do
+  local user_full_text = read_file(fixtures_dir .. "expected_user.dart")
+  local full_lines = {}
+  for line in (user_full_text .. "\n"):gmatch("([^\n]*)\n") do
+    full_lines[#full_lines + 1] = line
+  end
+
+  local full_clazzes = parser.parse_classes(user_full_text)
+  local full_user
+  for _, c in ipairs(full_clazzes) do
+    if c.name == "User" then full_user = c; break end
+  end
+
+  if full_user then
+    local blocks = incremental.detect_blocks(full_user, full_lines)
+
+    -- Generate fresh constructor and compare with existing
+    local fresh_constr = generator.generate_constructor(full_user)
+    local edit = incremental.build_edit("constructor", full_user, blocks, fresh_constr)
+    eq(edit, nil, "build_edit idempotent: constructor unchanged returns nil")
+
+    -- Generate fresh toString and compare
+    local fresh_ts = generator.generate_to_string(full_user)
+    local ts_edit = incremental.build_edit("toString", full_user, blocks, fresh_ts)
+    eq(ts_edit, nil, "build_edit idempotent: toString unchanged returns nil")
+
+    -- Generate fresh hashCode
+    local fresh_hc = generator.generate_hash_code(full_user)
+    local hc_edit = incremental.build_edit("hashCode", full_user, blocks, fresh_hc)
+    eq(hc_edit, nil, "build_edit idempotent: hashCode unchanged returns nil")
+  end
+end
+
+-- build_edit: insert when block absent
+do
+  local bare_text = "class Bare {\n  final String name;\n  final int age;\n}\n"
+  local bare_lines = {}
+  for line in (bare_text .. "\n"):gmatch("([^\n]*)\n") do
+    bare_lines[#bare_lines + 1] = line
+  end
+  local bare_clazzes = parser.parse_classes(bare_text)
+  local bare_class = bare_clazzes[1]
+
+  if bare_class then
+    local blocks = {}
+    local constr_text = generator.generate_constructor(bare_class)
+    local edit = incremental.build_edit("constructor", bare_class, blocks, constr_text)
+    ok(edit ~= nil, "build_edit insert: returns edit for absent block")
+    if edit then
+      eq(edit.action, "insert_after", "build_edit insert: action is insert_after")
+      ok(#edit.new_lines > 0, "build_edit insert: has new_lines")
+      -- First line should be blank separator
+      eq(edit.new_lines[1], "", "build_edit insert: first line is blank separator")
+    end
+  end
+end
+
+-- build_edit: replace when block differs
+do
+  -- Create a class with a constructor missing a field
+  local text = [[class TwoField {
+  final String name;
+  final int age;
+
+  const TwoField({
+    required this.name,
+  });
+}
+]]
+  local lines = {}
+  for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+    lines[#lines + 1] = line
+  end
+  local clazzes = parser.parse_classes(text)
+  local clazz = clazzes[1]
+
+  if clazz then
+    local blocks = incremental.detect_blocks(clazz, lines)
+    ok(blocks.constructor ~= nil, "build_edit replace: found partial constructor")
+
+    if blocks.constructor then
+      eq(#blocks.constructor.fields, 1, "build_edit replace: constructor has 1 field")
+
+      -- Generate a fresh constructor (should have 2 fields)
+      local fresh = generator.generate_constructor(clazz)
+      ok(fresh:find("this.age", 1, true) ~= nil, "build_edit replace: fresh has age field")
+
+      local edit = incremental.build_edit("constructor", clazz, blocks, fresh)
+      ok(edit ~= nil, "build_edit replace: returns edit for incomplete block")
+      if edit then
+        eq(edit.action, "replace", "build_edit replace: action is replace")
+        eq(edit.start_line, blocks.constructor.start_line, "build_edit replace: start_line matches")
+        eq(edit.end_line, blocks.constructor.end_line, "build_edit replace: end_line matches")
+        -- New lines should contain both fields
+        local new_text = table.concat(edit.new_lines, "\n")
+        ok(new_text:find("this.name", 1, true) ~= nil, "build_edit replace: new has name")
+        ok(new_text:find("this.age", 1, true) ~= nil, "build_edit replace: new has age")
+      end
+    end
+  end
+end
+
+--------------------------------------------------------------------------------
+io.write("\n=== Incremental: Apply Edits Tests ===\n")
+
+-- apply_edits: single insert
+do
+  local lines = { "line1", "line2", "line3", "line4" }
+  local edits = {
+    { start_line = 2, end_line = 2, new_lines = { "inserted_a", "inserted_b" }, action = "insert_after" },
+  }
+  local result = incremental.apply_edits(lines, edits)
+  eq(#result, 6, "apply_edits insert: total lines = 6")
+  eq(result[1], "line1", "apply_edits insert: line 1 unchanged")
+  eq(result[2], "line2", "apply_edits insert: line 2 unchanged")
+  eq(result[3], "inserted_a", "apply_edits insert: inserted line a")
+  eq(result[4], "inserted_b", "apply_edits insert: inserted line b")
+  eq(result[5], "line3", "apply_edits insert: line 3 shifted")
+  eq(result[6], "line4", "apply_edits insert: line 4 shifted")
+end
+
+-- apply_edits: single replace
+do
+  local lines = { "line1", "old2", "old3", "line4" }
+  local edits = {
+    { start_line = 2, end_line = 3, new_lines = { "new2" }, action = "replace" },
+  }
+  local result = incremental.apply_edits(lines, edits)
+  eq(#result, 3, "apply_edits replace: total lines = 3")
+  eq(result[1], "line1", "apply_edits replace: line 1 unchanged")
+  eq(result[2], "new2", "apply_edits replace: replaced lines")
+  eq(result[3], "line4", "apply_edits replace: line 4 unchanged")
+end
+
+-- apply_edits: multiple edits (descending order)
+do
+  local lines = { "a", "b", "c", "d", "e" }
+  local edits = {
+    { start_line = 4, end_line = 4, new_lines = { "D_replaced" }, action = "replace" },
+    { start_line = 2, end_line = 2, new_lines = { "B_replaced" }, action = "replace" },
+  }
+  local result = incremental.apply_edits(lines, edits)
+  eq(#result, 5, "apply_edits multi: total lines = 5")
+  eq(result[1], "a", "apply_edits multi: a unchanged")
+  eq(result[2], "B_replaced", "apply_edits multi: b replaced")
+  eq(result[3], "c", "apply_edits multi: c unchanged")
+  eq(result[4], "D_replaced", "apply_edits multi: d replaced")
+  eq(result[5], "e", "apply_edits multi: e unchanged")
+end
+
+-- apply_edits: empty edits returns same lines
+do
+  local lines = { "x", "y", "z" }
+  local result = incremental.apply_edits(lines, {})
+  eq(#result, 3, "apply_edits empty: same count")
+  eq(result[1], "x", "apply_edits empty: same content")
+end
+
+--------------------------------------------------------------------------------
+io.write("\n=== Incremental: Integration Tests ===\n")
+
+-- Full integration: generate all for bare User, detect blocks, verify idempotency
+do
+  -- Start with bare class
+  local bare_user_text = "class User {\n  final String name;\n  final int age;\n  final String? email;\n  final bool isActive;\n}\n"
+  local lines = {}
+  for line in (bare_user_text .. "\n"):gmatch("([^\n]*)\n") do
+    lines[#lines + 1] = line
+  end
+
+  local clazzes = parser.parse_classes(bare_user_text)
+  local clazz = clazzes[1]
+  ok(clazz ~= nil, "Integration: parsed bare User")
+
+  if clazz then
+    -- Step 1: detect blocks on bare class (all absent)
+    local blocks = incremental.detect_blocks(clazz, lines)
+    local field_names = incremental.get_class_field_names(clazz)
+    eq(incremental.block_status(blocks.constructor, field_names), "absent", "Integration: constructor absent initially")
+    eq(incremental.block_status(blocks.copyWith, field_names), "absent", "Integration: copyWith absent initially")
+
+    -- Step 2: generate all methods and build edits
+    local all_kinds = { "constructor", "copyWith", "toMap", "fromMap", "toJson", "fromJson", "toString", "equality", "hashCode" }
+    local edits = {}
+
+    for _, kind in ipairs(all_kinds) do
+      local gen_text, _ = nil, {}
+      if kind == "constructor" then
+        gen_text = generator.generate_constructor(clazz)
+      elseif kind == "copyWith" then
+        gen_text = generator.generate_copy_with(clazz)
+      elseif kind == "toMap" then
+        gen_text = generator.generate_to_map(clazz)
+      elseif kind == "fromMap" then
+        gen_text = generator.generate_from_map(clazz)
+      elseif kind == "toJson" then
+        gen_text = generator.generate_to_json(clazz)
+      elseif kind == "fromJson" then
+        gen_text = generator.generate_from_json(clazz)
+      elseif kind == "toString" then
+        gen_text = generator.generate_to_string(clazz)
+      elseif kind == "equality" then
+        gen_text = generator.generate_equality(clazz)
+      elseif kind == "hashCode" then
+        gen_text = generator.generate_hash_code(clazz)
+      end
+
+      if gen_text then
+        local edit = incremental.build_edit(kind, clazz, blocks, gen_text)
+        if edit then
+          edits[#edits + 1] = edit
+        end
+      end
+    end
+
+    ok(#edits > 0, "Integration: produced edits for bare class")
+
+    -- Step 3: apply edits
+    local new_lines = incremental.apply_edits(lines, edits)
+    ok(#new_lines > #lines, "Integration: new lines longer than bare class")
+
+    local new_text = table.concat(new_lines, "\n")
+    ok(new_text:find("const User({", 1, true) ~= nil, "Integration: has constructor")
+    ok(new_text:find("copyWith({", 1, true) ~= nil, "Integration: has copyWith")
+    ok(new_text:find("toMap()", 1, true) ~= nil, "Integration: has toMap")
+    ok(new_text:find("fromMap(", 1, true) ~= nil, "Integration: has fromMap")
+    ok(new_text:find("toJson()", 1, true) ~= nil, "Integration: has toJson")
+    ok(new_text:find("fromJson(", 1, true) ~= nil, "Integration: has fromJson")
+    ok(new_text:find("toString()", 1, true) ~= nil, "Integration: has toString")
+    ok(new_text:find("operator ==(", 1, true) ~= nil, "Integration: has equality")
+    ok(new_text:find("hashCode", 1, true) ~= nil, "Integration: has hashCode")
+    -- Should end with }
+    ok(utils.trim(new_lines[#new_lines]) == "}" or utils.trim(new_lines[#new_lines - 1]) == "}",
+      "Integration: class body ends with }")
+
+    -- Step 4: IDEMPOTENCY — re-parse, re-detect, re-generate → no edits
+    local round2_clazzes = parser.parse_classes(new_text)
+    local round2_clazz
+    for _, c in ipairs(round2_clazzes) do
+      if c.name == "User" then round2_clazz = c; break end
+    end
+    ok(round2_clazz ~= nil, "Integration idempotent: re-parsed User")
+
+    if round2_clazz then
+      local round2_blocks = incremental.detect_blocks(round2_clazz, new_lines)
+      local round2_edits = {}
+      local round2_fields = incremental.get_class_field_names(round2_clazz)
+
+      for _, kind in ipairs(all_kinds) do
+        local gen_text = nil
+        if kind == "constructor" then
+          gen_text = generator.generate_constructor(round2_clazz)
+        elseif kind == "copyWith" then
+          gen_text = generator.generate_copy_with(round2_clazz)
+        elseif kind == "toMap" then
+          gen_text = generator.generate_to_map(round2_clazz)
+        elseif kind == "fromMap" then
+          gen_text = generator.generate_from_map(round2_clazz)
+        elseif kind == "toJson" then
+          gen_text = generator.generate_to_json(round2_clazz)
+        elseif kind == "fromJson" then
+          gen_text = generator.generate_from_json(round2_clazz)
+        elseif kind == "toString" then
+          gen_text = generator.generate_to_string(round2_clazz)
+        elseif kind == "equality" then
+          gen_text = generator.generate_equality(round2_clazz)
+        elseif kind == "hashCode" then
+          gen_text = generator.generate_hash_code(round2_clazz)
+        end
+
+        if gen_text then
+          local edit = incremental.build_edit(kind, round2_clazz, round2_blocks, gen_text)
+          if edit then
+            round2_edits[#round2_edits + 1] = edit
+            io.write("    [DEBUG] Non-idempotent edit for " .. kind .. " (action=" .. edit.action .. ")\n")
+          end
+        end
+      end
+
+      eq(#round2_edits, 0, "Integration idempotent: second run produces 0 edits")
+    end
+  end
+end
+
+-- Cross-action safety: generate constructor, then generate copyWith, constructor still intact
+do
+  local bare_text = "class Safe {\n  final String x;\n  final int y;\n}\n"
+  local lines = {}
+  for line in (bare_text .. "\n"):gmatch("([^\n]*)\n") do
+    lines[#lines + 1] = line
+  end
+
+  local clazzes = parser.parse_classes(bare_text)
+  local clazz = clazzes[1]
+
+  if clazz then
+    -- Generate constructor
+    local blocks = incremental.detect_blocks(clazz, lines)
+    local constr_text = generator.generate_constructor(clazz)
+    local edit1 = incremental.build_edit("constructor", clazz, blocks, constr_text)
+    ok(edit1 ~= nil, "Cross-action: constructor edit produced")
+    if edit1 then
+      -- Apply constructor
+      lines = incremental.apply_edits(lines, { edit1 })
+
+      -- Re-parse
+      local text_after = table.concat(lines, "\n")
+      local clazzes2 = parser.parse_classes(text_after)
+      local clazz2 = clazzes2[1]
+
+      if clazz2 then
+        -- Now generate copyWith
+        local blocks2 = incremental.detect_blocks(clazz2, lines)
+        ok(blocks2.constructor ~= nil, "Cross-action: constructor still detected after re-parse")
+
+        local copy_text = generator.generate_copy_with(clazz2)
+        local edit2 = incremental.build_edit("copyWith", clazz2, blocks2, copy_text)
+        ok(edit2 ~= nil, "Cross-action: copyWith edit produced")
+        if edit2 then
+          lines = incremental.apply_edits(lines, { edit2 })
+          local final_text = table.concat(lines, "\n")
+
+          -- Verify constructor is still intact
+          ok(final_text:find("const Safe({", 1, true) ~= nil, "Cross-action: constructor still present")
+          ok(final_text:find("required this.x", 1, true) ~= nil, "Cross-action: constructor has x")
+          ok(final_text:find("required this.y", 1, true) ~= nil, "Cross-action: constructor has y")
+
+          -- Verify copyWith is present
+          ok(final_text:find("copyWith({", 1, true) ~= nil, "Cross-action: copyWith present")
+          ok(final_text:find("x ?? this.x", 1, true) ~= nil, "Cross-action: copyWith has x")
+          ok(final_text:find("y ?? this.y", 1, true) ~= nil, "Cross-action: copyWith has y")
+        end
+      end
+    end
+  end
+end
+
+-- Incremental update: generate constructor for class, add field, re-generate → only new field added
+do
+  -- Start with 2-field class and generate constructor
+  local text = "class Grow {\n  final String a;\n  final int b;\n}\n"
+  local lines = {}
+  for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+    lines[#lines + 1] = line
+  end
+
+  local clazzes = parser.parse_classes(text)
+  local clazz = clazzes[1]
+
+  if clazz then
+    local blocks = incremental.detect_blocks(clazz, lines)
+    local constr = generator.generate_constructor(clazz)
+    local edit = incremental.build_edit("constructor", clazz, blocks, constr)
+    if edit then
+      lines = incremental.apply_edits(lines, { edit })
+    end
+
+    -- Now simulate adding a third field
+    -- Insert "  final bool c;" before the closing brace
+    local new_lines_with_field = {}
+    for i, l in ipairs(lines) do
+      -- Find the blank line before constructor and insert new field before it
+      if utils.trim(l) == "" and i > 2 and utils.trim(lines[i + 1] or ""):find("Safe") ~= nil then
+        new_lines_with_field[#new_lines_with_field + 1] = "  final bool c;"
+      end
+      new_lines_with_field[#new_lines_with_field + 1] = l
+    end
+
+    -- Actually, let's be more direct: insert after line 3 (final int b;)
+    new_lines_with_field = {}
+    for i, l in ipairs(lines) do
+      new_lines_with_field[#new_lines_with_field + 1] = l
+      if l:find("final int b;", 1, true) then
+        new_lines_with_field[#new_lines_with_field + 1] = "  final bool c;"
+      end
+    end
+
+    local new_text = table.concat(new_lines_with_field, "\n")
+    local new_clazzes = parser.parse_classes(new_text)
+    local new_clazz = new_clazzes[1]
+
+    if new_clazz then
+      eq(#new_clazz:gen_properties(), 3, "Incremental update: now 3 fields")
+      local new_blocks = incremental.detect_blocks(new_clazz, new_lines_with_field)
+      ok(new_blocks.constructor ~= nil, "Incremental update: constructor still detected")
+
+      if new_blocks.constructor then
+        -- Constructor should now be incomplete (missing 'c')
+        local field_names = incremental.get_class_field_names(new_clazz)
+        local status = incremental.block_status(new_blocks.constructor, field_names)
+        eq(status, "incomplete", "Incremental update: constructor is incomplete")
+
+        local missing = incremental.missing_fields(field_names, new_blocks.constructor.fields)
+        eq(#missing, 1, "Incremental update: 1 missing field")
+        eq(missing[1], "c", "Incremental update: missing field is 'c'")
+
+        -- Re-generate and build edit
+        local fresh_constr = generator.generate_constructor(new_clazz)
+        local update_edit = incremental.build_edit("constructor", new_clazz, new_blocks, fresh_constr)
+        ok(update_edit ~= nil, "Incremental update: edit produced")
+        if update_edit then
+          eq(update_edit.action, "replace", "Incremental update: action is replace")
+          local updated_text = table.concat(update_edit.new_lines, "\n")
+          ok(updated_text:find("this.a", 1, true) ~= nil, "Incremental update: has old field a")
+          ok(updated_text:find("this.b", 1, true) ~= nil, "Incremental update: has old field b")
+          ok(updated_text:find("this.c", 1, true) ~= nil, "Incremental update: has new field c")
+        end
+      end
+    end
+  end
+end
+
+-- Test with expected_user.dart: all blocks complete, all statuses should be complete
+do
+  local user_full_text = read_file(fixtures_dir .. "expected_user.dart")
+  local full_lines = {}
+  for line in (user_full_text .. "\n"):gmatch("([^\n]*)\n") do
+    full_lines[#full_lines + 1] = line
+  end
+
+  local full_clazzes = parser.parse_classes(user_full_text)
+  local full_user
+  for _, c in ipairs(full_clazzes) do
+    if c.name == "User" then full_user = c; break end
+  end
+
+  if full_user then
+    local blocks = incremental.detect_blocks(full_user, full_lines)
+    local field_names = incremental.get_class_field_names(full_user)
+
+    eq(incremental.block_status(blocks.constructor, field_names), "complete", "Status: constructor complete")
+    eq(incremental.block_status(blocks.copyWith, field_names), "complete", "Status: copyWith complete")
+    eq(incremental.block_status(blocks.toMap, field_names), "complete", "Status: toMap complete")
+    eq(incremental.block_status(blocks.toString, field_names), "complete", "Status: toString complete")
+    eq(incremental.block_status(blocks.equality, field_names), "complete", "Status: equality complete")
+    eq(incremental.block_status(blocks.hashCode, field_names), "complete", "Status: hashCode complete")
+    eq(incremental.wrapper_status(blocks.toJson), "complete", "Status: toJson complete")
+    eq(incremental.wrapper_status(blocks.fromJson), "complete", "Status: fromJson complete")
+  end
+end
+
+-- Test block detection with multi-line constructor body (arrow fromJson)
+do
+  local text = [[class Arrow {
+  final String name;
+
+  factory Arrow.fromJson(String source) =>
+      Arrow.fromMap(Map<String, dynamic>.from(json.decode(source)));
+}
+]]
+  local lines = {}
+  for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+    lines[#lines + 1] = line
+  end
+
+  local clazzes = parser.parse_classes(text)
+  local clazz = clazzes[1]
+  if clazz then
+    local blocks = incremental.detect_blocks(clazz, lines)
+    ok(blocks.fromJson ~= nil, "Arrow fromJson: detected multi-line arrow factory")
+    if blocks.fromJson then
+      -- Should span both lines
+      ok(blocks.fromJson.end_line > blocks.fromJson.start_line,
+        "Arrow fromJson: spans multiple lines")
+    end
+  end
+end
+
+-- Test: single-line toJson arrow method detected
+do
+  local text = [[class Single {
+  final String name;
+
+  String toJson() => json.encode(toMap());
+}
+]]
+  local lines = {}
+  for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+    lines[#lines + 1] = line
+  end
+
+  local clazzes = parser.parse_classes(text)
+  local clazz = clazzes[1]
+  if clazz then
+    local blocks = incremental.detect_blocks(clazz, lines)
+    ok(blocks.toJson ~= nil, "Single-line toJson: detected")
+    if blocks.toJson then
+      eq(blocks.toJson.start_line, blocks.toJson.end_line, "Single-line toJson: same start/end")
+    end
   end
 end
 

@@ -1,44 +1,249 @@
 local parser = require("dart-class-tools.parser")
 local generator = require("dart-class-tools.generator")
+local incremental = require("dart-class-tools.incremental")
 
 local M = {}
 
---- Apply a generation result to the current buffer.
+--------------------------------------------------------------------------------
+-- Helpers
+--------------------------------------------------------------------------------
+
+--- The canonical order of method kinds that form a "data class".
+local ALL_KINDS = {
+  "constructor", "copyWith", "toMap", "fromMap", "toJson", "fromJson",
+  "toString", "equality", "hashCode",
+}
+
+--- Which kinds have field-level tracking (so we can detect incomplete blocks).
+local FIELD_TRACKED = {
+  constructor = true,
+  copyWith = true,
+  toMap = true,
+  fromMap = true,
+  toString = true,
+  equality = true,
+  hashCode = true,
+}
+
+--- Determine which kinds are applicable for a given class.
+---@param clazz DartClass
+---@return table<string, boolean>
+local function applicable_kinds(clazz)
+  local kinds = { constructor = true }
+
+  if clazz:is_widget() then
+    -- Widgets only get constructor
+    return kinds
+  end
+
+  local skip_instance = clazz:is_abstract() or clazz:is_sealed()
+  if clazz:has_superclass() and not clazz:is_abstract() and not clazz:is_sealed() then
+    skip_instance = false
+  end
+
+  if not skip_instance then
+    kinds.copyWith = true
+    kinds.toMap = true
+    kinds.fromMap = true
+    kinds.toJson = true
+    kinds.fromJson = true
+  end
+
+  kinds.toString = true
+  kinds.equality = true
+  kinds.hashCode = true
+
+  return kinds
+end
+
+--- Get the status of each method kind for a class.
+---@param clazz DartClass
+---@param blocks table<string, MethodBlock>
+---@return table<string, BlockStatus>
+local function get_all_statuses(clazz, blocks)
+  local class_fields = incremental.get_class_field_names(clazz)
+  local statuses = {}
+
+  for _, kind in ipairs(ALL_KINDS) do
+    if kind == "toJson" or kind == "fromJson" then
+      statuses[kind] = incremental.wrapper_status(blocks[kind])
+    elseif FIELD_TRACKED[kind] then
+      statuses[kind] = incremental.block_status(blocks[kind], class_fields)
+    else
+      statuses[kind] = blocks[kind] and "complete" or "absent"
+    end
+  end
+
+  return statuses
+end
+
+--- Get a human-readable title for a code action.
+---@param kind string
+---@param status BlockStatus
+---@return string
+local function action_title(kind, status)
+  local names = {
+    constructor = "constructor",
+    copyWith = "copyWith",
+    toMap = "toMap",
+    fromMap = "fromMap",
+    toJson = "toJson",
+    fromJson = "fromJson",
+    toString = "toString",
+    equality = "equality (== & hashCode)",
+    dataClass = "data class",
+  }
+  local name = names[kind] or kind
+
+  if status == "incomplete" then
+    return "Update " .. name .. " (add missing fields)"
+  elseif status == "absent" then
+    return "Generate " .. name
+  else
+    return "Regenerate " .. name
+  end
+end
+
+--------------------------------------------------------------------------------
+-- Incremental apply: the core of the new architecture
+--
+-- Instead of rebuilding the entire class, we:
+-- 1. Detect existing blocks and their field coverage
+-- 2. Generate only the requested method(s) fresh
+-- 3. Compare with existing blocks → produce minimal edits
+-- 4. Apply edits to the buffer
+--------------------------------------------------------------------------------
+
+--- Generate the text for a single kind, returning the generated text and imports.
+---@param clazz DartClass
+---@param kind string
+---@return string|nil text, string[] imports
+local function generate_kind(clazz, kind)
+  local imports = {}
+  local text
+
+  if kind == "constructor" then
+    text = generator.generate_constructor(clazz)
+  elseif kind == "copyWith" then
+    local t, imps = generator.generate_copy_with(clazz)
+    text = t
+    imports = imps or {}
+  elseif kind == "toMap" then
+    text = generator.generate_to_map(clazz)
+  elseif kind == "fromMap" then
+    local t, imps = generator.generate_from_map(clazz)
+    text = t
+    imports = imps or {}
+  elseif kind == "toJson" then
+    local t, imps = generator.generate_to_json(clazz)
+    text = t
+    imports = imps or {}
+  elseif kind == "fromJson" then
+    local t, imps = generator.generate_from_json(clazz)
+    text = t
+    imports = imps or {}
+  elseif kind == "toString" then
+    text = generator.generate_to_string(clazz)
+  elseif kind == "equality" then
+    local t, imps = generator.generate_equality(clazz)
+    text = t
+    imports = imps or {}
+  elseif kind == "hashCode" then
+    local t, imps = generator.generate_hash_code(clazz)
+    text = t
+    imports = imps or {}
+  end
+
+  return text, imports
+end
+
+--- Apply incremental edits for the given kind(s) to a buffer.
+--- This is the main entry point for executing actions.
 ---@param bufnr number
 ---@param clazz DartClass
----@param part? string specific part to generate, or nil for all
-local function apply_generation(bufnr, clazz, part)
-  local result = generator.generate(clazz, part)
-  if not result then
-    vim.notify("dart-class-tools: no changes generated", vim.log.levels.WARN)
-    return
-  end
-
+---@param kinds string[] list of kinds to generate/update
+local function apply_incremental(bufnr, clazz, kinds)
+  -- Re-parse to get fresh state
   local line_count = vim.api.nvim_buf_line_count(bufnr)
   local buf_lines = vim.api.nvim_buf_get_lines(bufnr, 0, line_count, false)
-  -- Convert to 1-indexed table
-  local buf_lines_1 = {}
-  for i, l in ipairs(buf_lines) do
-    buf_lines_1[i] = l
-  end
 
-  local new_lines, imports = generator.build_class_text(buf_lines_1, clazz, result)
+  -- Convert to 1-indexed
+  local lines_1 = {}
+  for i, l in ipairs(buf_lines) do lines_1[i] = l end
 
-  if #new_lines == 0 then
-    vim.notify("dart-class-tools: no changes to apply", vim.log.levels.INFO)
+  -- Re-parse the file to get fresh class state
+  local text = table.concat(buf_lines, "\n")
+  local clazzes = parser.parse_classes(text)
+  local fresh_clazz = parser.find_class_at_line(clazzes, clazz.starts_at_line)
+  if not fresh_clazz or not fresh_clazz:is_valid() then
+    vim.notify("dart-class-tools: could not re-parse class", vim.log.levels.WARN)
     return
   end
 
-  -- Replace class lines in the buffer (0-indexed for nvim api)
-  vim.api.nvim_buf_set_lines(bufnr, clazz.starts_at_line - 1, clazz.ends_at_line, false, new_lines)
+  -- Detect existing blocks
+  local blocks = incremental.detect_blocks(fresh_clazz, lines_1)
+
+  -- Collect all edits and imports
+  local edits = {}
+  local all_imports = {}
+
+  local function add_import(imp)
+    for _, existing in ipairs(all_imports) do
+      if existing == imp then return end
+    end
+    all_imports[#all_imports + 1] = imp
+  end
+
+  for _, kind in ipairs(kinds) do
+    local gen_text, imports = generate_kind(fresh_clazz, kind)
+    if gen_text then
+      local edit = incremental.build_edit(kind, fresh_clazz, blocks, gen_text)
+      if edit then
+        edits[#edits + 1] = edit
+        -- After inserting, update blocks table for subsequent kinds' insertion points
+        -- We fake a block entry so the next kind knows where to insert after
+        if edit.action == "insert_after" then
+          local new_end = edit.start_line + #edit.new_lines
+          blocks[kind] = {
+            kind = kind,
+            start_line = edit.start_line + 1,
+            end_line = new_end,
+            fields = incremental.get_class_field_names(fresh_clazz),
+            text = gen_text,
+          }
+        else
+          -- Replace: update block entry
+          blocks[kind] = {
+            kind = kind,
+            start_line = edit.start_line,
+            end_line = edit.start_line + #edit.new_lines - 1,
+            fields = incremental.get_class_field_names(fresh_clazz),
+            text = gen_text,
+          }
+        end
+      end
+      for _, imp in ipairs(imports) do add_import(imp) end
+    end
+  end
+
+  if #edits == 0 and #all_imports == 0 then
+    vim.notify("dart-class-tools: no changes needed (already up to date)", vim.log.levels.INFO)
+    return
+  end
+
+  -- Apply edits to buffer
+  if #edits > 0 then
+    local new_lines = incremental.apply_edits(lines_1, edits)
+    vim.api.nvim_buf_set_lines(bufnr, 0, line_count, false, new_lines)
+  end
 
   -- Handle imports
-  if imports and #imports > 0 then
+  if #all_imports > 0 then
     local current_lines = vim.api.nvim_buf_get_lines(bufnr, 0, vim.api.nvim_buf_line_count(bufnr), false)
     local existing_text = table.concat(current_lines, "\n")
 
     local new_imports = {}
-    for _, imp in ipairs(imports) do
+    for _, imp in ipairs(all_imports) do
       local import_str
       if imp:sub(1, 6) == "import" then
         import_str = imp
@@ -47,7 +252,6 @@ local function apply_generation(bufnr, clazz, part)
       end
 
       if not existing_text:find(import_str, 1, true) then
-        -- Also check if already has the import without exact match
         local package_part = imp:match("package:(.+)") or imp
         local has_import = false
         for _, line in ipairs(current_lines) do
@@ -63,7 +267,6 @@ local function apply_generation(bufnr, clazz, part)
     end
 
     if #new_imports > 0 then
-      -- Find insertion point (after existing imports or at top)
       local insert_line = 0
       for i, line in ipairs(current_lines) do
         if line:match("^import ") or line:match("^export ") or line:match("^part ") then
@@ -71,9 +274,7 @@ local function apply_generation(bufnr, clazz, part)
         end
       end
 
-      -- Add blank line before first import if needed
       if insert_line == 0 then
-        -- Insert at very top, but after any library declarations or comments
         for i, line in ipairs(current_lines) do
           if line:match("^library ") or line:match("^//") then
             insert_line = i
@@ -83,12 +284,10 @@ local function apply_generation(bufnr, clazz, part)
         end
       end
 
-      -- Insert new imports
       for j, imp_line in ipairs(new_imports) do
         vim.api.nvim_buf_set_lines(bufnr, insert_line + j - 1, insert_line + j - 1, false, { imp_line })
       end
 
-      -- Add blank line after imports if next line isn't blank
       local after_import_line = insert_line + #new_imports
       local all_lines = vim.api.nvim_buf_get_lines(bufnr, 0, vim.api.nvim_buf_line_count(bufnr), false)
       if after_import_line < #all_lines and all_lines[after_import_line + 1] ~= "" then
@@ -98,44 +297,9 @@ local function apply_generation(bufnr, clazz, part)
   end
 end
 
---- Get the action title for a part.
----@param part string
----@return string
-local function action_title(part)
-  local titles = {
-    constructor = "Generate constructor",
-    copyWith = "Generate copyWith",
-    toMap = "Generate toMap",
-    fromMap = "Generate fromMap",
-    toJson = "Generate toJson",
-    fromJson = "Generate fromJson",
-    toString = "Generate toString",
-    equality = "Generate equality",
-    dataClass = "Generate data class",
-  }
-  return titles[part] or ("Generate " .. part)
-end
-
---- Check which methods already exist in the class.
----@param clazz DartClass
----@return table<string,boolean>
-local function existing_methods(clazz)
-  local exists = {}
-  if parser.method_exists(clazz, clazz.name .. "({") or parser.method_exists(clazz, clazz.name .. "([") or parser.method_exists(clazz, clazz.name .. "(") then
-    -- Check more carefully: does the class have a real constructor (not just the class name appearing)
-    if clazz:has_constructor() then
-      exists.constructor = true
-    end
-  end
-  if parser.method_exists(clazz, "copyWith(") then exists.copyWith = true end
-  if parser.method_exists(clazz, "Map<String,dynamic>toMap()") then exists.toMap = true end
-  if parser.method_exists(clazz, "factory" .. clazz.name .. ".fromMap(") then exists.fromMap = true end
-  if parser.method_exists(clazz, "StringtoJson()") then exists.toJson = true end
-  if parser.method_exists(clazz, "factory" .. clazz.name .. ".fromJson(") then exists.fromJson = true end
-  if parser.method_exists(clazz, "StringtoString()") then exists.toString = true end
-  if parser.method_exists(clazz, "booloperator==") then exists.equality = true end
-  return exists
-end
+--------------------------------------------------------------------------------
+-- Code action provider
+--------------------------------------------------------------------------------
 
 --- Provide code actions for the current buffer position.
 ---@param bufnr number
@@ -149,122 +313,87 @@ function M.get_code_actions(bufnr, cursor_line)
   local clazz = parser.find_class_at_line(clazzes, cursor_line)
 
   if not clazz or not clazz:is_valid() then return {} end
-
-  -- Skip enum declarations — we only generate for classes
   if clazz.is_enum_decl then return {} end
-
   if not parser.is_valid_action_position(clazz, cursor_line) then return {} end
 
-  local exists = existing_methods(clazz)
+  -- Convert to 1-indexed for block detection
+  local lines_1 = {}
+  for i, l in ipairs(lines) do lines_1[i] = l end
+
+  local blocks = incremental.detect_blocks(clazz, lines_1)
+  local statuses = get_all_statuses(clazz, blocks)
+  local kinds = applicable_kinds(clazz)
+
   local actions = {}
 
-  local is_widget = clazz:is_widget()
-  local is_abstract_or_sealed = clazz:is_abstract() or clazz:is_sealed()
-  -- Allow sealed subclasses
-  local skip_instance = is_abstract_or_sealed
-    and not (clazz:has_superclass() and not clazz:is_abstract() and not clazz:is_sealed())
-
-  -- Data class action (full generation) -- not for widgets
-  if not is_widget then
-    actions[#actions + 1] = {
-      title = action_title("dataClass"),
-      kind = "quickfix",
-      bufnr = bufnr,
-      clazz = clazz,
-      part = nil,
-    }
-  end
-
-  -- Constructor
-  if not exists.constructor then
-    actions[#actions + 1] = {
-      title = action_title("constructor"),
-      kind = "quickfix",
-      bufnr = bufnr,
-      clazz = clazz,
-      part = "constructor",
-    }
-  end
-
-  if not is_widget then
-    if not skip_instance then
-      -- copyWith
-      if not exists.copyWith then
-        actions[#actions + 1] = {
-          title = action_title("copyWith"),
-          kind = "quickfix",
-          bufnr = bufnr,
-          clazz = clazz,
-          part = "copyWith",
-        }
-      end
-
-      -- toMap
-      if not exists.toMap then
-        actions[#actions + 1] = {
-          title = action_title("toMap"),
-          kind = "quickfix",
-          bufnr = bufnr,
-          clazz = clazz,
-          part = "toMap",
-        }
-      end
-
-      -- fromMap
-      if not exists.fromMap then
-        actions[#actions + 1] = {
-          title = action_title("fromMap"),
-          kind = "quickfix",
-          bufnr = bufnr,
-          clazz = clazz,
-          part = "fromMap",
-        }
-      end
-
-      -- toJson
-      if not exists.toJson then
-        actions[#actions + 1] = {
-          title = action_title("toJson"),
-          kind = "quickfix",
-          bufnr = bufnr,
-          clazz = clazz,
-          part = "toJson",
-        }
-      end
-
-      -- fromJson
-      if not exists.fromJson then
-        actions[#actions + 1] = {
-          title = action_title("fromJson"),
-          kind = "quickfix",
-          bufnr = bufnr,
-          clazz = clazz,
-          part = "fromJson",
-        }
+  -- Data class action: show if ANY kind is absent or incomplete
+  if not clazz:is_widget() then
+    local any_needed = false
+    for _, kind in ipairs(ALL_KINDS) do
+      if kinds[kind] then
+        local s = statuses[kind]
+        if s == "absent" or s == "incomplete" then
+          any_needed = true
+          break
+        end
       end
     end
 
-    -- toString
-    if not exists.toString then
+    if any_needed then
+      -- Determine if it's a generate or update
+      local any_exists = false
+      for _, kind in ipairs(ALL_KINDS) do
+        if kinds[kind] and statuses[kind] ~= "absent" then
+          any_exists = true
+          break
+        end
+      end
+      local dc_title = any_exists and "Update data class (add missing)" or "Generate data class"
       actions[#actions + 1] = {
-        title = action_title("toString"),
+        title = dc_title,
         kind = "quickfix",
         bufnr = bufnr,
         clazz = clazz,
-        part = "toString",
+        action_kinds = nil, -- nil means "all applicable"
       }
+    end
+  end
+
+  -- Individual actions: only show if absent or incomplete
+  for _, kind in ipairs(ALL_KINDS) do
+    if not kinds[kind] then goto continue end
+
+    -- equality and hashCode are bundled together
+    if kind == "hashCode" then goto continue end
+
+    local status = statuses[kind]
+    -- For equality, also check hashCode
+    if kind == "equality" then
+      local hc_status = statuses.hashCode
+      -- If both are complete, skip
+      if status == "complete" and hc_status == "complete" then goto continue end
+      -- If either is absent/incomplete, show action
+      if status == "complete" and hc_status ~= "complete" then
+        status = hc_status
+      end
     end
 
-    -- equality (== and hashCode)
-    if not exists.equality then
-      actions[#actions + 1] = {
-        title = action_title("equality"),
-        kind = "quickfix",
-        bufnr = bufnr,
-        clazz = clazz,
-        part = "equality",
-      }
+    if status == "complete" then goto continue end
+
+    local action_kinds = { kind }
+    if kind == "equality" then
+      action_kinds = { "equality", "hashCode" }
     end
+
+    actions[#actions + 1] = {
+      title = action_title(kind, status),
+      kind = "quickfix",
+      bufnr = bufnr,
+      clazz = clazz,
+      action_kinds = action_kinds,
+    }
+
+    ::continue::
   end
 
   return actions
@@ -273,7 +402,27 @@ end
 --- Execute a code action.
 ---@param action table code action from get_code_actions
 function M.execute_action(action)
-  apply_generation(action.bufnr, action.clazz, action.part)
+  local clazz = action.clazz
+  local bufnr = action.bufnr
+
+  if action.action_kinds then
+    -- Specific kinds requested
+    apply_incremental(bufnr, clazz, action.action_kinds)
+  else
+    -- Data class: generate all applicable kinds
+    local kinds = applicable_kinds(clazz)
+    local ordered = {}
+    for _, kind in ipairs(ALL_KINDS) do
+      if kinds[kind] then ordered[#ordered + 1] = kind end
+    end
+    apply_incremental(bufnr, clazz, ordered)
+  end
 end
+
+-- Export for testing
+M.applicable_kinds = applicable_kinds
+M.get_all_statuses = get_all_statuses
+M.apply_incremental = apply_incremental
+M.generate_kind = generate_kind
 
 return M

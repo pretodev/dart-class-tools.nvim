@@ -643,6 +643,11 @@ end
 ---@field starts_at_line number
 ---@field ends_at_line number
 
+--- Generate all (or one specific part of) boilerplate methods for a class.
+--- NOTE: In the incremental architecture, actions.lua uses the individual
+--- generator functions directly (generate_constructor, generate_copy_with, etc.)
+--- and build_edit() from incremental.lua. This function is retained for tests
+--- and Dart validation scripts.
 ---@param clazz DartClass
 ---@param part? string specific part to generate, or nil for all
 ---@return GenerationResult|nil
@@ -737,7 +742,10 @@ function M.generate(clazz, part)
 end
 
 --- Build the complete class text with generated methods.
----@param buf_lines string[] buffer lines (0-indexed array from nvim api)
+--- NOTE: In the incremental architecture, incremental.lua's build_edit() and
+--- apply_edits() replace this function for runtime use. This function is
+--- retained for tests and Dart validation scripts.
+---@param buf_lines string[] buffer lines (1-indexed array)
 ---@param clazz DartClass
 ---@param result table from M.generate()
 ---@return string[] new_lines to replace, string[] imports_needed
