@@ -243,8 +243,23 @@ local function apply_incremental(bufnr, clazz, kinds)
 
   -- Apply edits to buffer
   if #edits > 0 then
-    local new_lines = incremental.apply_edits(lines_1, edits)
-    vim.api.nvim_buf_set_lines(bufnr, 0, line_count, false, new_lines)
+    -- Apply edits atomically using minimal diffs, bottom-up
+    table.sort(edits, function(a, b)
+      if a.start_line ~= b.start_line then
+        return a.start_line > b.start_line
+      end
+      local ao = a._canonical_order or 0
+      local bo = b._canonical_order or 0
+      return ao > bo
+    end)
+
+    for _, edit in ipairs(edits) do
+      if edit.action == "replace" then
+        vim.api.nvim_buf_set_lines(bufnr, edit.start_line - 1, edit.end_line, false, edit.new_lines)
+      elseif edit.action == "insert_after" then
+        vim.api.nvim_buf_set_lines(bufnr, edit.start_line, edit.start_line, false, edit.new_lines)
+      end
+    end
   end
 
   -- Handle imports

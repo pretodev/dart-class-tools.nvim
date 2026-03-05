@@ -3524,6 +3524,381 @@ class Second {
 end
 
 --------------------------------------------------------------------------------
+-- MANDATORY CASES A-D: Sequential single-action execution
+--
+-- These tests verify the user's explicit requirements:
+--   Case A: constructor → copyWith: both must be present.
+--   Case B: copyWith → constructor: both must be present.
+--   Case C: run the same action twice: must be idempotent—update or no-op, no duplicates.
+--   Case D: two classes in the same file: each action must modify only the selected class.
+--
+-- Each action is applied sequentially (not batched) by re-parsing the buffer
+-- between actions, exactly as apply_incremental does in practice.
+--------------------------------------------------------------------------------
+io.write("\n=== Mandatory Cases A-D: Sequential Single-Action ===\n")
+
+--- Helper: apply a SINGLE action to a buffer, re-parsing fresh each time.
+--- This simulates what actions.apply_incremental does for one code action.
+---@param buf_lines string[] 1-indexed lines
+---@param class_name string target class
+---@param kind string e.g. "constructor", "copyWith"
+---@return string[] new_lines, string new_text, number edit_count
+local function apply_single_action(buf_lines, class_name, kind)
+  local text = table.concat(buf_lines, "\n")
+  local clazzes = parser.parse_classes(text)
+  local clazz = parser.find_class_by_name(clazzes, class_name)
+  if not clazz then
+    error("apply_single_action: could not find class '" .. class_name .. "'")
+  end
+
+  local blocks = incremental.detect_blocks(clazz, buf_lines)
+
+  local gen_text
+  if kind == "constructor" then
+    gen_text = generator.generate_constructor(clazz)
+  elseif kind == "copyWith" then
+    gen_text = (generator.generate_copy_with(clazz))
+  elseif kind == "toMap" then
+    gen_text = generator.generate_to_map(clazz)
+  elseif kind == "fromMap" then
+    gen_text = (generator.generate_from_map(clazz))
+  elseif kind == "toJson" then
+    gen_text = (generator.generate_to_json(clazz))
+  elseif kind == "fromJson" then
+    gen_text = (generator.generate_from_json(clazz))
+  elseif kind == "toString" then
+    gen_text = generator.generate_to_string(clazz)
+  elseif kind == "equality" then
+    gen_text = (generator.generate_equality(clazz))
+  elseif kind == "hashCode" then
+    gen_text = (generator.generate_hash_code(clazz))
+  end
+
+  if not gen_text then
+    return buf_lines, table.concat(buf_lines, "\n"), 0
+  end
+
+  local edit = incremental.build_edit(kind, clazz, blocks, gen_text)
+  if not edit then
+    return buf_lines, table.concat(buf_lines, "\n"), 0
+  end
+
+  local new_lines = incremental.apply_edits(buf_lines, { edit })
+  return new_lines, table.concat(new_lines, "\n"), 1
+end
+
+-- The exact expected output from the user's specification:
+local EXPECTED_USER_OUTPUT = [[class User {
+  final String name;
+
+  const User({
+    required this.name,
+  });
+
+  User copyWith({
+    String? name,
+  }) {
+    return User(
+      name: name ?? this.name,
+    );
+  }
+}]]
+
+-- ===========================================================================
+-- Case A: constructor → copyWith (both must be present)
+-- ===========================================================================
+do
+  io.write("\n--- Case A: constructor → copyWith ---\n")
+
+  local input = [[class User {
+  final String name;
+}
+]]
+  local lines = {}
+  for line in (input .. "\n"):gmatch("([^\n]*)\n") do
+    lines[#lines + 1] = line
+  end
+  -- Remove trailing empty line if present (from trailing \n\n)
+  while #lines > 0 and lines[#lines] == "" do lines[#lines] = nil end
+
+  -- Step 1: Generate constructor
+  local lines_after_ctor, text_after_ctor, edits_ctor = apply_single_action(lines, "User", "constructor")
+  ok(edits_ctor > 0, "Case A: constructor edit produced")
+  ok(text_after_ctor:find("const User({", 1, true) ~= nil, "Case A: constructor present after step 1")
+  ok(text_after_ctor:find("required this.name", 1, true) ~= nil, "Case A: constructor has 'required this.name'")
+  -- copyWith should NOT be present yet
+  ok(text_after_ctor:find("copyWith") == nil, "Case A: no copyWith after step 1")
+
+  -- Step 2: Generate copyWith (re-parses the buffer with constructor already in it)
+  local lines_final, text_final, edits_cw = apply_single_action(lines_after_ctor, "User", "copyWith")
+  ok(edits_cw > 0, "Case A: copyWith edit produced")
+
+  -- Both must be present
+  ok(text_final:find("const User({", 1, true) ~= nil, "Case A: constructor STILL present after copyWith")
+  ok(text_final:find("required this.name", 1, true) ~= nil, "Case A: constructor has 'required this.name' after copyWith")
+  ok(text_final:find("copyWith({", 1, true) ~= nil, "Case A: copyWith present after step 2")
+  ok(text_final:find("name ?? this.name", 1, true) ~= nil, "Case A: copyWith has 'name ?? this.name'")
+
+  -- Verify exact expected output
+  -- Trim trailing whitespace/newlines for comparison
+  local trimmed_final = text_final:gsub("%s+$", "")
+  local trimmed_expected = EXPECTED_USER_OUTPUT:gsub("%s+$", "")
+  if trimmed_final == trimmed_expected then
+    passed = passed + 1
+    io.write("  PASS: Case A: exact output matches user specification\n")
+  else
+    failed = failed + 1
+    local detail = "Case A: exact output does NOT match user specification"
+    errors[#errors + 1] = detail
+    io.write("  FAIL: " .. detail .. "\n")
+    io.write("  --- EXPECTED ---\n")
+    io.write(trimmed_expected .. "\n")
+    io.write("  --- GOT ---\n")
+    io.write(trimmed_final .. "\n")
+    io.write("  --- END ---\n")
+  end
+
+  -- Verify constructor comes BEFORE copyWith in the output
+  local ctor_pos = text_final:find("const User({", 1, true)
+  local cw_pos = text_final:find("copyWith({", 1, true)
+  ok(ctor_pos ~= nil and cw_pos ~= nil and ctor_pos < cw_pos,
+    "Case A: constructor appears before copyWith")
+end
+
+-- ===========================================================================
+-- Case B: copyWith → constructor (both must be present)
+-- ===========================================================================
+do
+  io.write("\n--- Case B: copyWith → constructor ---\n")
+
+  local input = [[class User {
+  final String name;
+}
+]]
+  local lines = {}
+  for line in (input .. "\n"):gmatch("([^\n]*)\n") do
+    lines[#lines + 1] = line
+  end
+  while #lines > 0 and lines[#lines] == "" do lines[#lines] = nil end
+
+  -- Step 1: Generate copyWith FIRST
+  local lines_after_cw, text_after_cw, edits_cw = apply_single_action(lines, "User", "copyWith")
+  ok(edits_cw > 0, "Case B: copyWith edit produced")
+  ok(text_after_cw:find("copyWith({", 1, true) ~= nil, "Case B: copyWith present after step 1")
+  ok(text_after_cw:find("name ?? this.name", 1, true) ~= nil, "Case B: copyWith has 'name ?? this.name'")
+  -- Constructor should NOT be present yet (the class had none)
+  ok(text_after_cw:find("const User({", 1, true) == nil, "Case B: no constructor after step 1 (only copyWith)")
+
+  -- Step 2: Generate constructor (re-parses the buffer with copyWith already in it)
+  local lines_final, text_final, edits_ctor = apply_single_action(lines_after_cw, "User", "constructor")
+  ok(edits_ctor > 0, "Case B: constructor edit produced")
+
+  -- Both must be present
+  ok(text_final:find("const User({", 1, true) ~= nil, "Case B: constructor present after step 2")
+  ok(text_final:find("required this.name", 1, true) ~= nil, "Case B: constructor has 'required this.name'")
+  ok(text_final:find("copyWith({", 1, true) ~= nil, "Case B: copyWith STILL present after constructor")
+  ok(text_final:find("name ?? this.name", 1, true) ~= nil, "Case B: copyWith has 'name ?? this.name' after constructor")
+
+  -- Verify exact expected output
+  local trimmed_final = text_final:gsub("%s+$", "")
+  local trimmed_expected = EXPECTED_USER_OUTPUT:gsub("%s+$", "")
+  if trimmed_final == trimmed_expected then
+    passed = passed + 1
+    io.write("  PASS: Case B: exact output matches user specification\n")
+  else
+    failed = failed + 1
+    local detail = "Case B: exact output does NOT match user specification"
+    errors[#errors + 1] = detail
+    io.write("  FAIL: " .. detail .. "\n")
+    io.write("  --- EXPECTED ---\n")
+    io.write(trimmed_expected .. "\n")
+    io.write("  --- GOT ---\n")
+    io.write(trimmed_final .. "\n")
+    io.write("  --- END ---\n")
+  end
+
+  -- Verify constructor comes BEFORE copyWith in the output
+  local ctor_pos = text_final:find("const User({", 1, true)
+  local cw_pos = text_final:find("copyWith({", 1, true)
+  ok(ctor_pos ~= nil and cw_pos ~= nil and ctor_pos < cw_pos,
+    "Case B: constructor appears before copyWith (stable ordering)")
+end
+
+-- ===========================================================================
+-- Case C: Idempotency — run the same action twice, no duplicates
+-- ===========================================================================
+do
+  io.write("\n--- Case C: Idempotency ---\n")
+
+  local input = [[class User {
+  final String name;
+}
+]]
+  local lines = {}
+  for line in (input .. "\n"):gmatch("([^\n]*)\n") do
+    lines[#lines + 1] = line
+  end
+  while #lines > 0 and lines[#lines] == "" do lines[#lines] = nil end
+
+  -- Step 1: Generate constructor
+  local lines1, text1, edits1 = apply_single_action(lines, "User", "constructor")
+  ok(edits1 > 0, "Case C: first constructor edit produced")
+
+  -- Step 2: Generate constructor AGAIN (should be a no-op)
+  local lines2, text2, edits2 = apply_single_action(lines1, "User", "constructor")
+  eq(edits2, 0, "Case C: second constructor run produces 0 edits (idempotent)")
+  eq(text1, text2, "Case C: text unchanged after second constructor run")
+
+  -- Step 3: Generate copyWith
+  local lines3, text3, edits3 = apply_single_action(lines2, "User", "copyWith")
+  ok(edits3 > 0, "Case C: first copyWith edit produced")
+
+  -- Step 4: Generate copyWith AGAIN (should be a no-op)
+  local lines4, text4, edits4 = apply_single_action(lines3, "User", "copyWith")
+  eq(edits4, 0, "Case C: second copyWith run produces 0 edits (idempotent)")
+  eq(text3, text4, "Case C: text unchanged after second copyWith run")
+
+  -- Step 5: Generate constructor AGAIN after copyWith was added (should STILL be idempotent)
+  local lines5, text5, edits5 = apply_single_action(lines4, "User", "constructor")
+  eq(edits5, 0, "Case C: third constructor run after copyWith produces 0 edits")
+  eq(text4, text5, "Case C: text unchanged after third constructor run")
+
+  -- No duplicates: count occurrences of constructor and copyWith
+  local _, ctor_count = text5:gsub("const User%({", "")
+  eq(ctor_count, 1, "Case C: exactly 1 constructor in final output")
+  local _, cw_count = text5:gsub("copyWith%({", "")
+  eq(cw_count, 1, "Case C: exactly 1 copyWith in final output")
+
+  -- Verify the final output still matches the expected
+  local trimmed_final = text5:gsub("%s+$", "")
+  local trimmed_expected = EXPECTED_USER_OUTPUT:gsub("%s+$", "")
+  eq(trimmed_final, trimmed_expected, "Case C: final output matches user specification")
+end
+
+-- ===========================================================================
+-- Case D: Two classes in the same file — each action only modifies its class
+-- ===========================================================================
+do
+  io.write("\n--- Case D: Two classes in same file ---\n")
+
+  local input = [[class User {
+  final String name;
+}
+
+class Product {
+  final String title;
+  final double price;
+}
+]]
+  local lines = {}
+  for line in (input .. "\n"):gmatch("([^\n]*)\n") do
+    lines[#lines + 1] = line
+  end
+  while #lines > 0 and lines[#lines] == "" do lines[#lines] = nil end
+
+  -- Step 1: Generate constructor for User
+  local lines1, text1, edits1 = apply_single_action(lines, "User", "constructor")
+  ok(edits1 > 0, "Case D: User constructor edit produced")
+
+  -- Product should be UNCHANGED
+  local p_clazzes = parser.parse_classes(text1)
+  local p_product = parser.find_class_by_name(p_clazzes, "Product")
+  ok(p_product ~= nil, "Case D: Product still parseable after User constructor")
+  if p_product then
+    local product_text = table.concat(lines1, "\n", p_product.starts_at_line, p_product.ends_at_line)
+    ok(product_text:find("this.title") == nil, "Case D: Product untouched after User constructor")
+    ok(product_text:find("copyWith") == nil, "Case D: Product has no copyWith after User constructor")
+  end
+
+  -- User should have constructor
+  local u_clazzes = parser.parse_classes(text1)
+  local u_user = parser.find_class_by_name(u_clazzes, "User")
+  ok(u_user ~= nil, "Case D: User parseable after constructor")
+  if u_user then
+    local user_text = table.concat(lines1, "\n", u_user.starts_at_line, u_user.ends_at_line)
+    ok(user_text:find("const User({", 1, true) ~= nil, "Case D: User has constructor")
+    ok(user_text:find("this.name", 1, true) ~= nil, "Case D: User constructor has name field")
+  end
+
+  -- Step 2: Generate constructor for Product
+  local lines2, text2, edits2 = apply_single_action(lines1, "Product", "constructor")
+  ok(edits2 > 0, "Case D: Product constructor edit produced")
+
+  -- User's constructor should still be there unchanged
+  local u2_clazzes = parser.parse_classes(text2)
+  local u2_user = parser.find_class_by_name(u2_clazzes, "User")
+  ok(u2_user ~= nil, "Case D: User parseable after Product constructor")
+  if u2_user then
+    local user_text = table.concat(lines2, "\n", u2_user.starts_at_line, u2_user.ends_at_line)
+    ok(user_text:find("const User({", 1, true) ~= nil, "Case D: User constructor preserved after Product gen")
+    -- User should NOT have Product's fields
+    ok(user_text:find("this.title") == nil, "Case D: User doesn't have Product's 'title'")
+    ok(user_text:find("this.price") == nil, "Case D: User doesn't have Product's 'price'")
+  end
+
+  -- Product should have its own constructor
+  local p2_product = parser.find_class_by_name(u2_clazzes, "Product")
+  ok(p2_product ~= nil, "Case D: Product parseable after its constructor")
+  if p2_product then
+    local product_text = table.concat(lines2, "\n", p2_product.starts_at_line, p2_product.ends_at_line)
+    ok(product_text:find("const Product({", 1, true) ~= nil, "Case D: Product has constructor")
+    ok(product_text:find("this.title", 1, true) ~= nil, "Case D: Product constructor has title")
+    ok(product_text:find("this.price", 1, true) ~= nil, "Case D: Product constructor has price")
+    -- Product should NOT have User's fields
+    ok(product_text:find("this.name") == nil, "Case D: Product doesn't have User's 'name'")
+  end
+
+  -- Step 3: Generate copyWith for User
+  local lines3, text3, edits3 = apply_single_action(lines2, "User", "copyWith")
+  ok(edits3 > 0, "Case D: User copyWith edit produced")
+
+  -- Step 4: Generate copyWith for Product
+  local lines4, text4, edits4 = apply_single_action(lines3, "Product", "copyWith")
+  ok(edits4 > 0, "Case D: Product copyWith edit produced")
+
+  -- Final verification: both classes have both methods, no cross-contamination
+  local final_clazzes = parser.parse_classes(text4)
+  local final_user = parser.find_class_by_name(final_clazzes, "User")
+  local final_product = parser.find_class_by_name(final_clazzes, "Product")
+
+  ok(final_user ~= nil, "Case D Final: User parsed")
+  ok(final_product ~= nil, "Case D Final: Product parsed")
+
+  if final_user then
+    local user_text = table.concat(lines4, "\n", final_user.starts_at_line, final_user.ends_at_line)
+    ok(user_text:find("const User({", 1, true) ~= nil, "Case D Final: User has constructor")
+    ok(user_text:find("required this.name", 1, true) ~= nil, "Case D Final: User constructor has name")
+    ok(user_text:find("copyWith({", 1, true) ~= nil, "Case D Final: User has copyWith")
+    ok(user_text:find("name ?? this.name", 1, true) ~= nil, "Case D Final: User copyWith has name")
+    -- No Product fields
+    ok(user_text:find("this.title") == nil, "Case D Final: User has no 'title'")
+    ok(user_text:find("this.price") == nil, "Case D Final: User has no 'price'")
+  end
+
+  if final_product then
+    local product_text = table.concat(lines4, "\n", final_product.starts_at_line, final_product.ends_at_line)
+    ok(product_text:find("const Product({", 1, true) ~= nil, "Case D Final: Product has constructor")
+    ok(product_text:find("required this.title", 1, true) ~= nil, "Case D Final: Product constructor has title")
+    ok(product_text:find("required this.price", 1, true) ~= nil, "Case D Final: Product constructor has price")
+    ok(product_text:find("copyWith({", 1, true) ~= nil, "Case D Final: Product has copyWith")
+    ok(product_text:find("title ?? this.title", 1, true) ~= nil, "Case D Final: Product copyWith has title")
+    ok(product_text:find("price ?? this.price", 1, true) ~= nil, "Case D Final: Product copyWith has price")
+    -- No User fields
+    ok(product_text:find("this.name") == nil, "Case D Final: Product has no 'name' (from User)")
+  end
+
+  -- Idempotency for both classes
+  local lines5, text5, edits5 = apply_single_action(lines4, "User", "constructor")
+  eq(edits5, 0, "Case D Idempotent: User constructor no-op")
+  local lines6, text6, edits6 = apply_single_action(lines5, "User", "copyWith")
+  eq(edits6, 0, "Case D Idempotent: User copyWith no-op")
+  local lines7, text7, edits7 = apply_single_action(lines6, "Product", "constructor")
+  eq(edits7, 0, "Case D Idempotent: Product constructor no-op")
+  local lines8, text8, edits8 = apply_single_action(lines7, "Product", "copyWith")
+  eq(edits8, 0, "Case D Idempotent: Product copyWith no-op")
+end
+
+--------------------------------------------------------------------------------
 -- Summary
 --------------------------------------------------------------------------------
 io.write("\n==========================================\n")
