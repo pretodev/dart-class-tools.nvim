@@ -286,7 +286,8 @@ end
 
 function DartClass:has_named_constructor()
   if self.constr ~= nil then
-    local fConstr = self.constr:gsub("^%s*const%s*", "")
+    local fConstr = self.constr:gsub("^%s*const%s+", "")
+    fConstr = utils.trim(fConstr)
     return fConstr:sub(1, #self.name + 2) == self.name .. "({"
   end
   return true

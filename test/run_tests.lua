@@ -1749,6 +1749,921 @@ do
 end
 
 --------------------------------------------------------------------------------
+io.write("\n=== Incremental: Edge Case Tests ===\n")
+
+-- Helper: parse text into lines, parse class, return clazz + lines
+local function parse_class_lines(text)
+  local lines = {}
+  for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+    lines[#lines + 1] = line
+  end
+  local clazzes = parser.parse_classes(text)
+  return clazzes[1], lines
+end
+
+-- Helper: generate all applicable methods for a class, apply edits, return new lines + text.
+-- All absent blocks insert at the same original-space line (props_end); the canonical order
+-- tiebreaker in apply_edits handles correct stacking. Do NOT fake block entries — that
+-- produces post-edit-space line numbers which corrupt apply_edits.
+local function generate_all_incremental(clazz, lines, kinds)
+  kinds = kinds or { "constructor", "copyWith", "toMap", "fromMap", "toJson", "fromJson", "toString", "equality", "hashCode" }
+  local blocks = incremental.detect_blocks(clazz, lines)
+  local edits = {}
+  for _, kind in ipairs(kinds) do
+    local gen_text
+    if kind == "constructor" then
+      gen_text = generator.generate_constructor(clazz)
+    elseif kind == "copyWith" then
+      gen_text = (generator.generate_copy_with(clazz))
+    elseif kind == "toMap" then
+      gen_text = generator.generate_to_map(clazz)
+    elseif kind == "fromMap" then
+      gen_text = (generator.generate_from_map(clazz))
+    elseif kind == "toJson" then
+      gen_text = (generator.generate_to_json(clazz))
+    elseif kind == "fromJson" then
+      gen_text = (generator.generate_from_json(clazz))
+    elseif kind == "toString" then
+      gen_text = generator.generate_to_string(clazz)
+    elseif kind == "equality" then
+      gen_text = (generator.generate_equality(clazz))
+    elseif kind == "hashCode" then
+      gen_text = (generator.generate_hash_code(clazz))
+    end
+    if gen_text then
+      local edit = incremental.build_edit(kind, clazz, blocks, gen_text)
+      if edit then
+        edits[#edits + 1] = edit
+      end
+    end
+  end
+  local new_lines = incremental.apply_edits(lines, edits)
+  local new_text = table.concat(new_lines, "\n")
+  return new_lines, new_text, #edits
+end
+
+-- Helper: verify idempotency (second run produces 0 edits)
+local function verify_idempotent(new_lines, new_text, class_name, kinds)
+  kinds = kinds or { "constructor", "copyWith", "toMap", "fromMap", "toJson", "fromJson", "toString", "equality", "hashCode" }
+  local r2_clazzes = parser.parse_classes(new_text)
+  local r2_clazz
+  for _, c in ipairs(r2_clazzes) do
+    if c.name == class_name then r2_clazz = c; break end
+  end
+  if not r2_clazz then
+    ok(false, "Idempotent " .. class_name .. ": re-parsed class")
+    return
+  end
+  local r2_blocks = incremental.detect_blocks(r2_clazz, new_lines)
+  local r2_edits = 0
+  for _, kind in ipairs(kinds) do
+    local gen_text
+    if kind == "constructor" then
+      gen_text = generator.generate_constructor(r2_clazz)
+    elseif kind == "copyWith" then
+      gen_text = (generator.generate_copy_with(r2_clazz))
+    elseif kind == "toMap" then
+      gen_text = generator.generate_to_map(r2_clazz)
+    elseif kind == "fromMap" then
+      gen_text = (generator.generate_from_map(r2_clazz))
+    elseif kind == "toJson" then
+      gen_text = (generator.generate_to_json(r2_clazz))
+    elseif kind == "fromJson" then
+      gen_text = (generator.generate_from_json(r2_clazz))
+    elseif kind == "toString" then
+      gen_text = generator.generate_to_string(r2_clazz)
+    elseif kind == "equality" then
+      gen_text = (generator.generate_equality(r2_clazz))
+    elseif kind == "hashCode" then
+      gen_text = (generator.generate_hash_code(r2_clazz))
+    end
+    if gen_text then
+      local edit = incremental.build_edit(kind, r2_clazz, r2_blocks, gen_text)
+      if edit then
+        r2_edits = r2_edits + 1
+        io.write("    [DEBUG] Non-idempotent edit for " .. kind .. " (action=" .. edit.action .. ")\n")
+      end
+    end
+  end
+  eq(r2_edits, 0, "Idempotent " .. class_name .. ": second run produces 0 edits")
+end
+
+-- ===========================================================================
+-- 1. Nullable fields: NullableCollections (nullable List?, Map?, Set?)
+-- ===========================================================================
+do
+  local text = [[class NullableCollections {
+  final List<String>? tags;
+  final Map<String, dynamic>? metadata;
+  final Set<int>? ids;
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Edge Inc NullableColl: parsed")
+  if clazz then
+    local new_lines, new_text, edit_count = generate_all_incremental(clazz, lines)
+    ok(edit_count > 0, "Edge Inc NullableColl: edits produced")
+
+    -- Constructor: nullable fields should NOT have 'required'
+    ok(new_text:find("this.tags,", 1, true) ~= nil, "Edge Inc NullableColl: constructor has tags (no required)")
+    ok(new_text:find("this.metadata,", 1, true) ~= nil, "Edge Inc NullableColl: constructor has metadata (no required)")
+    ok(new_text:find("this.ids,", 1, true) ~= nil, "Edge Inc NullableColl: constructor has ids (no required)")
+    ok(new_text:find("required this.tags") == nil, "Edge Inc NullableColl: tags NOT required")
+
+    -- copyWith should handle nullable collections
+    ok(new_text:find("List<String>?", 1, true) ~= nil, "Edge Inc NullableColl: copyWith has List<String>?")
+    ok(new_text:find("tags ?? this.tags", 1, true) ~= nil, "Edge Inc NullableColl: copyWith tags uses ??")
+
+    -- toMap should handle nullable collections
+    ok(new_text:find("'tags':", 1, true) ~= nil, "Edge Inc NullableColl: toMap has tags key")
+    ok(new_text:find("'metadata':", 1, true) ~= nil, "Edge Inc NullableColl: toMap has metadata key")
+    ok(new_text:find("'ids':", 1, true) ~= nil, "Edge Inc NullableColl: toMap has ids key")
+
+    -- Idempotency
+    verify_idempotent(new_lines, new_text, "NullableCollections")
+  end
+end
+
+-- ===========================================================================
+-- 2. Late fields: WithLate (late field excluded from generation)
+-- ===========================================================================
+do
+  local text = [[class WithLate {
+  final String name;
+  late final String computed;
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Edge Inc WithLate: parsed")
+  if clazz then
+    -- gen_properties should exclude late field
+    local gen_props = clazz:gen_properties()
+    eq(#gen_props, 1, "Edge Inc WithLate: gen_properties has 1 (excludes late)")
+    eq(gen_props[1].name, "name", "Edge Inc WithLate: gen property is 'name'")
+
+    local new_lines, new_text, edit_count = generate_all_incremental(clazz, lines)
+    ok(edit_count > 0, "Edge Inc WithLate: edits produced")
+
+    -- Constructor should only have 'name', not 'computed'
+    ok(new_text:find("this.name", 1, true) ~= nil, "Edge Inc WithLate: constructor has name")
+    ok(new_text:find("this.computed") == nil, "Edge Inc WithLate: constructor excludes computed (late)")
+
+    -- Constructor should NOT be const (has late fields)
+    ok(new_text:find("const WithLate") == nil, "Edge Inc WithLate: constructor NOT const (has late)")
+
+    -- toString should only mention name
+    ok(new_text:find("name: $name", 1, true) ~= nil, "Edge Inc WithLate: toString has name")
+    ok(new_text:find("computed:") == nil, "Edge Inc WithLate: toString excludes computed")
+
+    -- late field line should still be present in output
+    ok(new_text:find("late final String computed;", 1, true) ~= nil,
+      "Edge Inc WithLate: late field preserved in output")
+
+    -- Idempotency
+    verify_idempotent(new_lines, new_text, "WithLate")
+  end
+end
+
+-- ===========================================================================
+-- 3. Non-final fields: MutableConfig (non-const constructor)
+-- ===========================================================================
+do
+  local text = [[class MutableConfig {
+  String host;
+  int port;
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Edge Inc MutableConfig: parsed")
+  if clazz then
+    ok(not clazz:all_properties_final(), "Edge Inc MutableConfig: not all_properties_final")
+
+    local new_lines, new_text, edit_count = generate_all_incremental(clazz, lines)
+    ok(edit_count > 0, "Edge Inc MutableConfig: edits produced")
+
+    -- Constructor should NOT be const
+    ok(new_text:find("const MutableConfig") == nil, "Edge Inc MutableConfig: constructor NOT const")
+    ok(new_text:find("MutableConfig({", 1, true) ~= nil, "Edge Inc MutableConfig: has constructor")
+
+    -- Non-final, non-nullable fields should be required
+    ok(new_text:find("required this.host", 1, true) ~= nil, "Edge Inc MutableConfig: host is required")
+    ok(new_text:find("required this.port", 1, true) ~= nil, "Edge Inc MutableConfig: port is required")
+
+    -- copyWith, toMap, etc. should work
+    ok(new_text:find("copyWith({", 1, true) ~= nil, "Edge Inc MutableConfig: has copyWith")
+    ok(new_text:find("host ?? this.host", 1, true) ~= nil, "Edge Inc MutableConfig: copyWith has host")
+
+    -- Idempotency
+    verify_idempotent(new_lines, new_text, "MutableConfig")
+  end
+end
+
+-- ===========================================================================
+-- 4. Mixed final/non-final: MixedFields
+-- ===========================================================================
+do
+  local text = [[class MixedFields {
+  final String id;
+  String name;
+  final int count;
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Edge Inc MixedFields: parsed")
+  if clazz then
+    ok(not clazz:all_properties_final(), "Edge Inc MixedFields: not all_properties_final")
+
+    local new_lines, new_text, edit_count = generate_all_incremental(clazz, lines)
+    ok(edit_count > 0, "Edge Inc MixedFields: edits produced")
+
+    -- Constructor NOT const
+    ok(new_text:find("const MixedFields") == nil, "Edge Inc MixedFields: constructor NOT const")
+
+    -- All three fields required (non-nullable)
+    ok(new_text:find("required this.id", 1, true) ~= nil, "Edge Inc MixedFields: id required")
+    ok(new_text:find("required this.name", 1, true) ~= nil, "Edge Inc MixedFields: name required")
+    ok(new_text:find("required this.count", 1, true) ~= nil, "Edge Inc MixedFields: count required")
+
+    -- toString has all 3 fields
+    ok(new_text:find("id: $id", 1, true) ~= nil, "Edge Inc MixedFields: toString has id")
+    ok(new_text:find("name: $name", 1, true) ~= nil, "Edge Inc MixedFields: toString has name")
+    ok(new_text:find("count: $count", 1, true) ~= nil, "Edge Inc MixedFields: toString has count")
+
+    -- Idempotency
+    verify_idempotent(new_lines, new_text, "MixedFields")
+  end
+end
+
+-- ===========================================================================
+-- 5. Existing constructor: WithConstructor (incremental adds other methods around it)
+-- ===========================================================================
+do
+  local text = [[class WithConstructor {
+  final String name;
+  final int age;
+
+  const WithConstructor({required this.name, required this.age});
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Edge Inc WithConstructor: parsed")
+  if clazz then
+    ok(clazz:has_constructor(), "Edge Inc WithConstructor: has existing constructor")
+
+    -- Block detection should find the existing constructor
+    local blocks = incremental.detect_blocks(clazz, lines)
+    ok(blocks.constructor ~= nil, "Edge Inc WithConstructor: detected existing constructor")
+    if blocks.constructor then
+      eq(#blocks.constructor.fields, 2, "Edge Inc WithConstructor: constructor has 2 fields")
+    end
+
+    -- Generate all methods (constructor should be unchanged, others inserted)
+    local new_lines, new_text, edit_count = generate_all_incremental(clazz, lines)
+    ok(edit_count > 0, "Edge Inc WithConstructor: edits produced for non-constructor methods")
+
+    -- Original constructor should be preserved
+    ok(new_text:find("const WithConstructor({", 1, true) ~= nil,
+      "Edge Inc WithConstructor: constructor preserved")
+
+    -- Other methods should be present
+    ok(new_text:find("copyWith({", 1, true) ~= nil, "Edge Inc WithConstructor: has copyWith")
+    ok(new_text:find("toMap()", 1, true) ~= nil, "Edge Inc WithConstructor: has toMap")
+    ok(new_text:find("toString()", 1, true) ~= nil, "Edge Inc WithConstructor: has toString")
+    ok(new_text:find("operator ==(", 1, true) ~= nil, "Edge Inc WithConstructor: has equality")
+
+    -- Idempotency
+    verify_idempotent(new_lines, new_text, "WithConstructor")
+  end
+end
+
+-- ===========================================================================
+-- 6. Const constructor: all-final class gets const
+-- ===========================================================================
+do
+  local text = [[class AllFinal {
+  final String x;
+  final int y;
+  final bool z;
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Edge Inc AllFinal: parsed")
+  if clazz then
+    ok(clazz:all_properties_final(), "Edge Inc AllFinal: all_properties_final")
+
+    local new_lines, new_text, edit_count = generate_all_incremental(clazz, lines)
+    ok(edit_count > 0, "Edge Inc AllFinal: edits produced")
+
+    -- Constructor should be const
+    ok(new_text:find("const AllFinal({", 1, true) ~= nil, "Edge Inc AllFinal: constructor IS const")
+
+    -- All fields required
+    ok(new_text:find("required this.x", 1, true) ~= nil, "Edge Inc AllFinal: x required")
+    ok(new_text:find("required this.y", 1, true) ~= nil, "Edge Inc AllFinal: y required")
+    ok(new_text:find("required this.z", 1, true) ~= nil, "Edge Inc AllFinal: z required")
+
+    -- Idempotency
+    verify_idempotent(new_lines, new_text, "AllFinal")
+  end
+end
+
+-- ===========================================================================
+-- 7. Default values config
+-- ===========================================================================
+do
+  -- Enable default values
+  local saved_config = vim.deepcopy(generator.config)
+  generator.config.constructor_default_values = true
+
+  local text = [[class WithDefaults {
+  final String name;
+  final int count;
+  final bool active;
+  final double price;
+  final List<String> tags;
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Edge Inc WithDefaults: parsed")
+  if clazz then
+    local new_lines, new_text, edit_count = generate_all_incremental(clazz, lines)
+    ok(edit_count > 0, "Edge Inc WithDefaults: edits produced")
+
+    -- With default values, non-nullable primitives get defaults instead of required
+    ok(new_text:find('this.name = ', 1, true) ~= nil, "Edge Inc WithDefaults: name has default")
+    ok(new_text:find('this.count = ', 1, true) ~= nil, "Edge Inc WithDefaults: count has default")
+    ok(new_text:find('this.active = ', 1, true) ~= nil, "Edge Inc WithDefaults: active has default")
+
+    -- Idempotency
+    verify_idempotent(new_lines, new_text, "WithDefaults")
+  end
+
+  -- Restore config
+  generator.config = saved_config
+end
+
+-- ===========================================================================
+-- 8. Collection types: Product (List<String> + Map<String, dynamic>)
+-- ===========================================================================
+do
+  local text = [[class Product {
+  final String title;
+  final double price;
+  final List<String> tags;
+  final Map<String, dynamic> metadata;
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Edge Inc Product: parsed")
+  if clazz then
+    local new_lines, new_text, edit_count = generate_all_incremental(clazz, lines)
+    ok(edit_count > 0, "Edge Inc Product: edits produced")
+
+    -- toMap should handle collections
+    ok(new_text:find("'tags': tags", 1, true) ~= nil, "Edge Inc Product: toMap has tags")
+    ok(new_text:find("'metadata': metadata", 1, true) ~= nil, "Edge Inc Product: toMap has metadata")
+
+    -- fromMap should cast collections
+    ok(new_text:find("fromMap(Map<String, dynamic>", 1, true) ~= nil,
+      "Edge Inc Product: has fromMap factory")
+
+    -- equality should use collection equality for List/Map
+    -- (depends on Flutter detection, but at minimum should have equality operator)
+    ok(new_text:find("operator ==(", 1, true) ~= nil, "Edge Inc Product: has equality")
+
+    -- Idempotency
+    verify_idempotent(new_lines, new_text, "Product")
+  end
+end
+
+-- ===========================================================================
+-- 9. Enum fields in class: Order (Status enum + DateTime + List<Product>)
+-- ===========================================================================
+do
+  local text = "enum Status { active, inactive, pending }\n\n" .. [[class Order {
+  final String id;
+  final Status status;
+  final Status? previousStatus;
+  final DateTime createdAt;
+  final List<Product> items;
+}
+]]
+  local clazzes = parser.parse_classes(text)
+  local clazz
+  for _, c in ipairs(clazzes) do
+    if c.name == "Order" then clazz = c; break end
+  end
+  ok(clazz ~= nil, "Edge Inc Order: parsed")
+  if clazz then
+    local lines = {}
+    for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+      lines[#lines + 1] = line
+    end
+
+    local new_lines, new_text, edit_count = generate_all_incremental(clazz, lines)
+    ok(edit_count > 0, "Edge Inc Order: edits produced")
+
+    -- toMap: enums use .name
+    ok(new_text:find("status.name", 1, true) ~= nil, "Edge Inc Order: toMap uses status.name")
+    ok(new_text:find("previousStatus?.name", 1, true) ~= nil, "Edge Inc Order: toMap uses previousStatus?.name")
+
+    -- toMap: DateTime uses toIso8601String
+    ok(new_text:find("createdAt.toUtc().toIso8601String()", 1, true) ~= nil,
+      "Edge Inc Order: toMap createdAt uses toIso8601String")
+
+    -- fromMap: DateTime.parse
+    ok(new_text:find("DateTime.parse", 1, true) ~= nil, "Edge Inc Order: fromMap uses DateTime.parse")
+
+    -- Constructor: nullable enum not required
+    ok(new_text:find("this.previousStatus,", 1, true) ~= nil,
+      "Edge Inc Order: nullable previousStatus not required in constructor")
+    ok(new_text:find("required this.status,", 1, true) ~= nil,
+      "Edge Inc Order: non-nullable status is required")
+
+    -- Idempotency
+    verify_idempotent(new_lines, new_text, "Order")
+  end
+end
+
+-- ===========================================================================
+-- 10. Generic class: Pair<A, B>
+-- ===========================================================================
+do
+  local text = [[class Pair<A, B> {
+  final A first;
+  final B second;
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Edge Inc Pair: parsed")
+  if clazz then
+    ok(clazz:type_name():find("Pair<A", 1, true) ~= nil, "Edge Inc Pair: type_name has generics")
+
+    local new_lines, new_text, edit_count = generate_all_incremental(clazz, lines)
+    ok(edit_count > 0, "Edge Inc Pair: edits produced")
+
+    -- copyWith should use Pair<A, B> return type
+    ok(new_text:find("Pair<A", 1, true) ~= nil, "Edge Inc Pair: copyWith uses generic type")
+
+    -- Constructor should have both fields
+    ok(new_text:find("this.first", 1, true) ~= nil, "Edge Inc Pair: constructor has first")
+    ok(new_text:find("this.second", 1, true) ~= nil, "Edge Inc Pair: constructor has second")
+
+    -- Idempotency
+    verify_idempotent(new_lines, new_text, "Pair")
+  end
+end
+
+-- ===========================================================================
+-- 11. Single property: Wrapper (arrow form toString/hashCode)
+-- ===========================================================================
+do
+  local text = [[class Wrapper {
+  final String value;
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Edge Inc Wrapper: parsed")
+  if clazz then
+    ok(clazz:few_props(), "Edge Inc Wrapper: few_props")
+
+    local new_lines, new_text, edit_count = generate_all_incremental(clazz, lines)
+    ok(edit_count > 0, "Edge Inc Wrapper: edits produced")
+
+    -- hashCode and toString should use arrow form for single prop
+    -- (Detect => in the hashCode/toString blocks)
+    local r_clazz, r_lines = parse_class_lines(new_text)
+    if r_clazz then
+      local r_blocks = incremental.detect_blocks(r_clazz, r_lines)
+      if r_blocks.hashCode then
+        ok(r_blocks.hashCode.text:find("=>", 1, true) ~= nil,
+          "Edge Inc Wrapper: hashCode uses arrow form")
+      end
+      if r_blocks.toString then
+        ok(r_blocks.toString.text:find("=>", 1, true) ~= nil,
+          "Edge Inc Wrapper: toString uses arrow form")
+      end
+    end
+
+    -- Idempotency
+    verify_idempotent(new_lines, new_text, "Wrapper")
+  end
+end
+
+-- ===========================================================================
+-- 12. Large class (> 4 props): block form for toString/hashCode
+-- ===========================================================================
+do
+  local text = [[class LargeClass {
+  final String a;
+  final String b;
+  final String c;
+  final String d;
+  final String e;
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Edge Inc LargeClass: parsed")
+  if clazz then
+    ok(not clazz:few_props(), "Edge Inc LargeClass: NOT few_props")
+
+    local new_lines, new_text, edit_count = generate_all_incremental(clazz, lines)
+    ok(edit_count > 0, "Edge Inc LargeClass: edits produced")
+
+    -- hashCode should use block form (> 4 props)
+    ok(new_text:find("int get hashCode {", 1, true) ~= nil,
+      "Edge Inc LargeClass: hashCode uses block form")
+
+    -- toString should have all 5 fields
+    ok(new_text:find("a: $a", 1, true) ~= nil, "Edge Inc LargeClass: toString has a")
+    ok(new_text:find("e: $e", 1, true) ~= nil, "Edge Inc LargeClass: toString has e")
+
+    -- Idempotency
+    verify_idempotent(new_lines, new_text, "LargeClass")
+  end
+end
+
+-- ===========================================================================
+-- 13. DateTime fields: Event (non-nullable + nullable DateTime)
+-- ===========================================================================
+do
+  local text = [[class Event {
+  final String title;
+  final DateTime startTime;
+  final DateTime? endTime;
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Edge Inc Event: parsed")
+  if clazz then
+    local new_lines, new_text, edit_count = generate_all_incremental(clazz, lines)
+    ok(edit_count > 0, "Edge Inc Event: edits produced")
+
+    -- toMap: non-nullable DateTime
+    ok(new_text:find("startTime.toUtc().toIso8601String()", 1, true) ~= nil,
+      "Edge Inc Event: toMap startTime")
+    -- toMap: nullable DateTime
+    ok(new_text:find("endTime?.toUtc().toIso8601String()", 1, true) ~= nil,
+      "Edge Inc Event: toMap endTime nullable")
+
+    -- fromMap: DateTime.parse
+    ok(new_text:find("DateTime.parse", 1, true) ~= nil, "Edge Inc Event: fromMap uses DateTime.parse")
+
+    -- Constructor: endTime nullable, not required
+    ok(new_text:find("this.endTime,", 1, true) ~= nil, "Edge Inc Event: endTime not required")
+    ok(new_text:find("required this.startTime", 1, true) ~= nil, "Edge Inc Event: startTime required")
+
+    -- Idempotency
+    verify_idempotent(new_lines, new_text, "Event")
+  end
+end
+
+-- ===========================================================================
+-- 14. Incremental update with nullable field added
+-- ===========================================================================
+do
+  -- Start with class that has name and age
+  local text = [[class Growing {
+  final String name;
+  final int age;
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Edge Inc Growing: parsed")
+  if clazz then
+    -- Generate all
+    local new_lines, new_text, _ = generate_all_incremental(clazz, lines)
+
+    -- Now add a nullable field
+    local updated_lines = {}
+    for i, l in ipairs(new_lines) do
+      updated_lines[#updated_lines + 1] = l
+      if l:find("final int age;", 1, true) then
+        updated_lines[#updated_lines + 1] = "  final String? email;"
+      end
+    end
+    local updated_text = table.concat(updated_lines, "\n")
+
+    local u_clazz
+    for _, c in ipairs(parser.parse_classes(updated_text)) do
+      if c.name == "Growing" then u_clazz = c; break end
+    end
+    ok(u_clazz ~= nil, "Edge Inc Growing: re-parsed after adding email")
+
+    if u_clazz then
+      eq(#u_clazz:gen_properties(), 3, "Edge Inc Growing: now 3 fields")
+
+      local u_blocks = incremental.detect_blocks(u_clazz, updated_lines)
+      local field_names = incremental.get_class_field_names(u_clazz)
+
+      -- Constructor should be incomplete
+      eq(incremental.block_status(u_blocks.constructor, field_names), "incomplete",
+        "Edge Inc Growing: constructor incomplete after adding email")
+
+      -- All field-tracked blocks should be incomplete
+      eq(incremental.block_status(u_blocks.copyWith, field_names), "incomplete",
+        "Edge Inc Growing: copyWith incomplete")
+      eq(incremental.block_status(u_blocks.toMap, field_names), "incomplete",
+        "Edge Inc Growing: toMap incomplete")
+      eq(incremental.block_status(u_blocks.toString, field_names), "incomplete",
+        "Edge Inc Growing: toString incomplete")
+      eq(incremental.block_status(u_blocks.equality, field_names), "incomplete",
+        "Edge Inc Growing: equality incomplete")
+      eq(incremental.block_status(u_blocks.hashCode, field_names), "incomplete",
+        "Edge Inc Growing: hashCode incomplete")
+
+      -- Regenerate all → should produce edits
+      local final_lines, final_text, final_edits = generate_all_incremental(u_clazz, updated_lines)
+      ok(final_edits > 0, "Edge Inc Growing: update edits produced")
+
+      -- email should now be in constructor (nullable, not required)
+      ok(final_text:find("this.email,", 1, true) ~= nil, "Edge Inc Growing: email in constructor")
+      ok(final_text:find("required this.email") == nil, "Edge Inc Growing: email NOT required (nullable)")
+
+      -- email in toString
+      ok(final_text:find("email: $email", 1, true) ~= nil, "Edge Inc Growing: email in toString")
+
+      -- email in equality
+      ok(final_text:find("other.email == email", 1, true) ~= nil, "Edge Inc Growing: email in equality")
+
+      -- email in hashCode
+      ok(final_text:find("email.hashCode", 1, true) ~= nil, "Edge Inc Growing: email in hashCode")
+
+      -- Idempotency after update
+      verify_idempotent(final_lines, final_text, "Growing")
+    end
+  end
+end
+
+-- ===========================================================================
+-- 15. Abstract class: only constructor + toString + equality + hashCode (no copyWith/serialization)
+-- ===========================================================================
+do
+  local text = [[abstract class Animal {
+  final String name;
+  final int age;
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Edge Inc Animal: parsed")
+  if clazz then
+    ok(clazz:is_abstract(), "Edge Inc Animal: is_abstract")
+
+    -- Only generate applicable kinds for abstract class
+    local kinds = { "constructor", "toString", "equality", "hashCode" }
+    local new_lines, new_text, edit_count = generate_all_incremental(clazz, lines, kinds)
+    ok(edit_count > 0, "Edge Inc Animal: edits produced")
+
+    ok(new_text:find("Animal({", 1, true) ~= nil, "Edge Inc Animal: has constructor")
+    ok(new_text:find("toString()", 1, true) ~= nil, "Edge Inc Animal: has toString")
+    ok(new_text:find("operator ==(", 1, true) ~= nil, "Edge Inc Animal: has equality")
+    ok(new_text:find("hashCode", 1, true) ~= nil, "Edge Inc Animal: has hashCode")
+
+    -- Idempotency
+    verify_idempotent(new_lines, new_text, "Animal", kinds)
+  end
+end
+
+-- ===========================================================================
+-- 16. Sealed class: constructor + toString + equality + hashCode only
+-- ===========================================================================
+do
+  local text = [[sealed class Shape {
+  final String color;
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Edge Inc Shape: parsed")
+  if clazz then
+    ok(clazz:is_sealed(), "Edge Inc Shape: is_sealed")
+
+    local kinds = { "constructor", "toString", "equality", "hashCode" }
+    local new_lines, new_text, edit_count = generate_all_incremental(clazz, lines, kinds)
+    ok(edit_count > 0, "Edge Inc Shape: edits produced")
+
+    ok(new_text:find("const Shape({", 1, true) ~= nil, "Edge Inc Shape: has const constructor")
+    ok(new_text:find("toString()", 1, true) ~= nil, "Edge Inc Shape: has toString")
+
+    -- Idempotency
+    verify_idempotent(new_lines, new_text, "Shape", kinds)
+  end
+end
+
+-- ===========================================================================
+-- 17. Cross-action safety with nullable + non-nullable mixed
+-- ===========================================================================
+do
+  local text = [[class CrossSafe {
+  final String name;
+  final int? optionalAge;
+  final List<String> items;
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Edge Inc CrossSafe: parsed")
+  if clazz then
+    -- Step 1: generate constructor only
+    local blocks = incremental.detect_blocks(clazz, lines)
+    local constr_text = generator.generate_constructor(clazz)
+    local edit1 = incremental.build_edit("constructor", clazz, blocks, constr_text)
+    ok(edit1 ~= nil, "Edge Inc CrossSafe: constructor edit produced")
+    if edit1 then
+      lines = incremental.apply_edits(lines, { edit1 })
+      local text_after = table.concat(lines, "\n")
+
+      -- Verify constructor has all 3 fields
+      ok(text_after:find("required this.name", 1, true) ~= nil, "Edge Inc CrossSafe: constructor has name (required)")
+      ok(text_after:find("this.optionalAge,", 1, true) ~= nil, "Edge Inc CrossSafe: constructor has optionalAge (not required)")
+      ok(text_after:find("required this.items", 1, true) ~= nil, "Edge Inc CrossSafe: constructor has items (required)")
+
+      -- Step 2: generate toMap
+      local clazz2 = parser.parse_classes(text_after)[1]
+      if clazz2 then
+        local blocks2 = incremental.detect_blocks(clazz2, lines)
+        ok(blocks2.constructor ~= nil, "Edge Inc CrossSafe: constructor preserved after re-parse")
+
+        local tomap_text = generator.generate_to_map(clazz2)
+        local edit2 = incremental.build_edit("toMap", clazz2, blocks2, tomap_text)
+        ok(edit2 ~= nil, "Edge Inc CrossSafe: toMap edit produced")
+        if edit2 then
+          lines = incremental.apply_edits(lines, { edit2 })
+          local final_text = table.concat(lines, "\n")
+
+          -- Constructor still intact
+          ok(final_text:find("required this.name", 1, true) ~= nil,
+            "Edge Inc CrossSafe: constructor still has name after toMap")
+          -- toMap present
+          ok(final_text:find("'name': name", 1, true) ~= nil, "Edge Inc CrossSafe: toMap has name")
+          ok(final_text:find("'items': items", 1, true) ~= nil, "Edge Inc CrossSafe: toMap has items")
+        end
+      end
+    end
+  end
+end
+
+-- ===========================================================================
+-- 18. Incremental update with field removal detection
+-- ===========================================================================
+do
+  -- Start with 3 fields, generate all, then remove one field
+  local text = [[class Shrinking {
+  final String a;
+  final int b;
+  final bool c;
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Edge Inc Shrinking: parsed")
+  if clazz then
+    local new_lines, new_text, _ = generate_all_incremental(clazz, lines)
+
+    -- Remove field 'b' from source
+    local trimmed_lines = {}
+    for _, l in ipairs(new_lines) do
+      if not l:find("final int b;", 1, true) then
+        trimmed_lines[#trimmed_lines + 1] = l
+      end
+    end
+    local trimmed_text = table.concat(trimmed_lines, "\n")
+
+    local t_clazz
+    for _, c in ipairs(parser.parse_classes(trimmed_text)) do
+      if c.name == "Shrinking" then t_clazz = c; break end
+    end
+    ok(t_clazz ~= nil, "Edge Inc Shrinking: re-parsed after removing b")
+
+    if t_clazz then
+      eq(#t_clazz:gen_properties(), 2, "Edge Inc Shrinking: now 2 fields")
+
+      -- Regenerate → should produce edits (methods still reference 'b')
+      local final_lines, final_text, final_edits = generate_all_incremental(t_clazz, trimmed_lines)
+      ok(final_edits > 0, "Edge Inc Shrinking: update edits produced after field removal")
+
+      -- 'b' should no longer be in generated methods
+      -- (check constructor - should only have a and c)
+      local f_clazz = parser.parse_classes(final_text)[1]
+      if f_clazz then
+        local f_blocks = incremental.detect_blocks(f_clazz, final_lines)
+        if f_blocks.constructor then
+          local c_fields = f_blocks.constructor.fields
+          local has_b = false
+          for _, f in ipairs(c_fields) do
+            if f == "b" then has_b = true end
+          end
+          ok(not has_b, "Edge Inc Shrinking: constructor no longer has field b")
+        end
+      end
+
+      -- Idempotency after field removal
+      verify_idempotent(final_lines, final_text, "Shrinking")
+    end
+  end
+end
+
+-- ===========================================================================
+-- 19. snake_case JSON key format
+-- ===========================================================================
+do
+  local saved_config = vim.deepcopy(generator.config)
+  generator.config.json_key_format = "snake_case"
+
+  local text = [[class SnakeCase {
+  final String firstName;
+  final int createdAt;
+  final bool isActive;
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Edge Inc SnakeCase: parsed")
+  if clazz then
+    local new_lines, new_text, edit_count = generate_all_incremental(clazz, lines)
+    ok(edit_count > 0, "Edge Inc SnakeCase: edits produced")
+
+    -- toMap should use snake_case keys
+    ok(new_text:find("'first_name':", 1, true) ~= nil, "Edge Inc SnakeCase: toMap has first_name key")
+    ok(new_text:find("'created_at':", 1, true) ~= nil, "Edge Inc SnakeCase: toMap has created_at key")
+    ok(new_text:find("'is_active':", 1, true) ~= nil, "Edge Inc SnakeCase: toMap has is_active key")
+
+    -- fromMap should also use snake_case keys
+    ok(new_text:find("map['first_name']", 1, true) ~= nil, "Edge Inc SnakeCase: fromMap has first_name key")
+    ok(new_text:find("map['created_at']", 1, true) ~= nil, "Edge Inc SnakeCase: fromMap has created_at key")
+
+    -- Idempotency
+    verify_idempotent(new_lines, new_text, "SnakeCase")
+  end
+
+  generator.config = saved_config
+end
+
+-- ===========================================================================
+-- 20. Nested custom type: Comment (User author, User? replyTo)
+-- ===========================================================================
+do
+  local text = [[class Comment {
+  final String text;
+  final User author;
+  final User? replyTo;
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Edge Inc Comment: parsed")
+  if clazz then
+    local new_lines, new_text, edit_count = generate_all_incremental(clazz, lines)
+    ok(edit_count > 0, "Edge Inc Comment: edits produced")
+
+    -- toMap: custom types use .toMap()
+    ok(new_text:find("author.toMap()", 1, true) ~= nil, "Edge Inc Comment: toMap author.toMap()")
+    ok(new_text:find("replyTo?.toMap()", 1, true) ~= nil, "Edge Inc Comment: toMap replyTo?.toMap()")
+
+    -- fromMap: custom type from map
+    ok(new_text:find("User.fromMap", 1, true) ~= nil, "Edge Inc Comment: fromMap User.fromMap")
+
+    -- Idempotency
+    verify_idempotent(new_lines, new_text, "Comment")
+  end
+end
+
+-- ===========================================================================
+-- 21. Subclass: Dog extends Animal (should allow copyWith/serialization)
+-- ===========================================================================
+do
+  local text = [[abstract class Animal {
+  final String name;
+  final int age;
+}
+
+class Dog extends Animal {
+  final String breed;
+}
+]]
+  local clazzes = parser.parse_classes(text)
+  local dog_clazz
+  for _, c in ipairs(clazzes) do
+    if c.name == "Dog" then dog_clazz = c; break end
+  end
+  ok(dog_clazz ~= nil, "Edge Inc Dog: parsed")
+  if dog_clazz then
+    ok(dog_clazz:has_superclass(), "Edge Inc Dog: has superclass")
+
+    local lines = {}
+    for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+      lines[#lines + 1] = line
+    end
+
+    local new_lines, new_text, edit_count = generate_all_incremental(dog_clazz, lines)
+    ok(edit_count > 0, "Edge Inc Dog: edits produced")
+
+    -- Should have copyWith and serialization methods
+    ok(new_text:find("copyWith({", 1, true) ~= nil, "Edge Inc Dog: has copyWith")
+    ok(new_text:find("toMap()", 1, true) ~= nil, "Edge Inc Dog: has toMap")
+    ok(new_text:find("this.breed", 1, true) ~= nil, "Edge Inc Dog: constructor has breed")
+
+    -- Idempotency
+    verify_idempotent(new_lines, new_text, "Dog")
+  end
+end
+
+--------------------------------------------------------------------------------
 -- Summary
 --------------------------------------------------------------------------------
 io.write("\n==========================================\n")
