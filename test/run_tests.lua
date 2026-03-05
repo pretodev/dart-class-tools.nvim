@@ -2663,6 +2663,866 @@ class Dog extends Animal {
   end
 end
 
+-- ===========================================================================
+-- 22. CROSS-CLASS CONTAMINATION: Two classes in one buffer
+--     Generate data class for User, then for Product — verify no cross-leak
+-- ===========================================================================
+io.write("\n=== Cross-Class Contamination Tests ===\n")
+do
+  local text = [[class User {
+  final String name;
+  final int age;
+}
+
+class Product {
+  final String title;
+  final double price;
+}
+]]
+
+  local lines = {}
+  for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+    lines[#lines + 1] = line
+  end
+
+  local clazzes = parser.parse_classes(text)
+  local user_clazz, product_clazz
+  for _, c in ipairs(clazzes) do
+    if c.name == "User" then user_clazz = c end
+    if c.name == "Product" then product_clazz = c end
+  end
+
+  ok(user_clazz ~= nil, "CrossClass: User parsed")
+  ok(product_clazz ~= nil, "CrossClass: Product parsed")
+
+  if user_clazz and product_clazz then
+    -- Step 1: Generate all methods for User
+    local user_new_lines, user_new_text, user_edit_count = generate_all_incremental(user_clazz, lines)
+    ok(user_edit_count > 0, "CrossClass: User edits produced")
+
+    -- Verify User output references only User fields
+    -- Find User class boundaries in the new text
+    local user_re_clazzes = parser.parse_classes(user_new_text)
+    local user_after
+    for _, c in ipairs(user_re_clazzes) do
+      if c.name == "User" then user_after = c; break end
+    end
+    ok(user_after ~= nil, "CrossClass: User re-parsed after generation")
+
+    if user_after then
+      -- User class should have name and age but NOT title or price
+      local user_class_text = table.concat(user_new_lines, "\n",
+        user_after.starts_at_line, user_after.ends_at_line)
+      ok(user_class_text:find("this.name", 1, true) ~= nil, "CrossClass: User constructor has name")
+      ok(user_class_text:find("this.age", 1, true) ~= nil, "CrossClass: User constructor has age")
+      ok(user_class_text:find("this.title", 1, true) == nil, "CrossClass: User does NOT have title")
+      ok(user_class_text:find("this.price", 1, true) == nil, "CrossClass: User does NOT have price")
+      ok(user_class_text:find("'name'", 1, true) ~= nil, "CrossClass: User toMap has 'name'")
+      ok(user_class_text:find("'age'", 1, true) ~= nil, "CrossClass: User toMap has 'age'")
+      ok(user_class_text:find("'title'", 1, true) == nil, "CrossClass: User toMap does NOT have 'title'")
+      ok(user_class_text:find("'price'", 1, true) == nil, "CrossClass: User toMap does NOT have 'price'")
+    end
+
+    -- Step 2: Now generate all methods for Product on the updated buffer
+    -- Re-parse the buffer to find Product's new line positions
+    local product_after
+    for _, c in ipairs(user_re_clazzes) do
+      if c.name == "Product" then product_after = c; break end
+    end
+    ok(product_after ~= nil, "CrossClass: Product re-parsed after User generation")
+
+    if product_after then
+      local final_lines, final_text, product_edit_count = generate_all_incremental(product_after, user_new_lines)
+      ok(product_edit_count > 0, "CrossClass: Product edits produced")
+
+      -- Re-parse to verify both classes
+      local final_clazzes = parser.parse_classes(final_text)
+      local final_user, final_product
+      for _, c in ipairs(final_clazzes) do
+        if c.name == "User" then final_user = c end
+        if c.name == "Product" then final_product = c end
+      end
+
+      ok(final_user ~= nil, "CrossClass: final User parsed")
+      ok(final_product ~= nil, "CrossClass: final Product parsed")
+
+      if final_user and final_product then
+        -- Extract text for each class
+        local final_user_text = table.concat(final_lines, "\n",
+          final_user.starts_at_line, final_user.ends_at_line)
+        local final_product_text = table.concat(final_lines, "\n",
+          final_product.starts_at_line, final_product.ends_at_line)
+
+        -- User's methods should STILL only reference User fields
+        ok(final_user_text:find("this.name", 1, true) ~= nil, "CrossClass Final: User has name")
+        ok(final_user_text:find("this.age", 1, true) ~= nil, "CrossClass Final: User has age")
+        ok(final_user_text:find("this.title", 1, true) == nil, "CrossClass Final: User NOT have title")
+        ok(final_user_text:find("this.price", 1, true) == nil, "CrossClass Final: User NOT have price")
+
+        -- Product's methods should only reference Product fields
+        ok(final_product_text:find("this.title", 1, true) ~= nil, "CrossClass Final: Product has title")
+        ok(final_product_text:find("this.price", 1, true) ~= nil, "CrossClass Final: Product has price")
+        ok(final_product_text:find("this.name", 1, true) == nil, "CrossClass Final: Product NOT have name")
+        ok(final_product_text:find("this.age", 1, true) == nil, "CrossClass Final: Product NOT have age")
+
+        -- Product toMap/fromMap should use Product fields only
+        ok(final_product_text:find("'title'", 1, true) ~= nil, "CrossClass Final: Product toMap 'title'")
+        ok(final_product_text:find("'price'", 1, true) ~= nil, "CrossClass Final: Product toMap 'price'")
+        ok(final_product_text:find("'name'", 1, true) == nil, "CrossClass Final: Product toMap NOT 'name'")
+        ok(final_product_text:find("'age'", 1, true) == nil, "CrossClass Final: Product toMap NOT 'age'")
+
+        -- User toMap should still have User fields
+        ok(final_user_text:find("'name'", 1, true) ~= nil, "CrossClass Final: User toMap 'name'")
+        ok(final_user_text:find("'age'", 1, true) ~= nil, "CrossClass Final: User toMap 'age'")
+
+        -- toString checks
+        ok(final_user_text:find("User(", 1, true) ~= nil, "CrossClass Final: User toString says User(")
+        ok(final_product_text:find("Product(", 1, true) ~= nil, "CrossClass Final: Product toString says Product(")
+        ok(final_user_text:find("Product(", 1, true) == nil, "CrossClass Final: User toString NOT Product(")
+        ok(final_product_text:find("User(", 1, true) == nil, "CrossClass Final: Product toString NOT User(")
+
+        -- equality: User uses 'other is User', Product uses 'other is Product'
+        ok(final_user_text:find("other is User", 1, true) ~= nil or
+           final_user_text:find("is! User", 1, true) ~= nil,
+           "CrossClass Final: User equality type check")
+        ok(final_product_text:find("other is Product", 1, true) ~= nil or
+           final_product_text:find("is! Product", 1, true) ~= nil,
+           "CrossClass Final: Product equality type check")
+
+        -- copyWith return types
+        ok(final_user_text:find("User copyWith(", 1, true) ~= nil, "CrossClass Final: User copyWith returns User")
+        ok(final_product_text:find("Product copyWith(", 1, true) ~= nil, "CrossClass Final: Product copyWith returns Product")
+
+        -- fromMap factory uses correct class name
+        ok(final_user_text:find("User.fromMap(", 1, true) ~= nil, "CrossClass Final: User.fromMap factory")
+        ok(final_product_text:find("Product.fromMap(", 1, true) ~= nil, "CrossClass Final: Product.fromMap factory")
+
+        -- fromJson factory uses correct class name
+        ok(final_user_text:find("User.fromJson(", 1, true) ~= nil, "CrossClass Final: User.fromJson factory")
+        ok(final_product_text:find("Product.fromJson(", 1, true) ~= nil, "CrossClass Final: Product.fromJson factory")
+
+        -- Idempotency for both classes after both are generated
+        verify_idempotent(final_lines, final_text, "User")
+        verify_idempotent(final_lines, final_text, "Product")
+      end
+    end
+  end
+end
+
+-- ===========================================================================
+-- 23. CROSS-CLASS: Three classes, generate in reverse order
+-- ===========================================================================
+do
+  local text = [[class Alpha {
+  final String a1;
+  final int a2;
+}
+
+class Beta {
+  final String b1;
+  final bool b2;
+}
+
+class Gamma {
+  final double g1;
+  final List<String> g2;
+}
+]]
+
+  local lines = {}
+  for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+    lines[#lines + 1] = line
+  end
+
+  local clazzes = parser.parse_classes(text)
+  -- Collect them by name
+  local by_name = {}
+  for _, c in ipairs(clazzes) do by_name[c.name] = c end
+
+  ok(by_name.Alpha ~= nil, "CrossClass3: Alpha parsed")
+  ok(by_name.Beta ~= nil, "CrossClass3: Beta parsed")
+  ok(by_name.Gamma ~= nil, "CrossClass3: Gamma parsed")
+
+  if by_name.Alpha and by_name.Beta and by_name.Gamma then
+    -- Generate in REVERSE order: Gamma first, then Beta, then Alpha
+    -- This tests that inserting into a later class doesn't corrupt earlier ones
+
+    -- Step 1: Generate Gamma
+    local l1, t1, e1 = generate_all_incremental(by_name.Gamma, lines)
+    ok(e1 > 0, "CrossClass3: Gamma edits produced")
+
+    -- Re-parse to find Beta at its new position
+    local c1 = parser.parse_classes(t1)
+    local beta_1
+    for _, c in ipairs(c1) do if c.name == "Beta" then beta_1 = c; break end end
+    ok(beta_1 ~= nil, "CrossClass3: Beta re-parsed after Gamma")
+
+    -- Step 2: Generate Beta
+    local l2, t2, e2 = generate_all_incremental(beta_1, l1)
+    ok(e2 > 0, "CrossClass3: Beta edits produced")
+
+    -- Re-parse to find Alpha at its new position
+    local c2 = parser.parse_classes(t2)
+    local alpha_2
+    for _, c in ipairs(c2) do if c.name == "Alpha" then alpha_2 = c; break end end
+    ok(alpha_2 ~= nil, "CrossClass3: Alpha re-parsed after Beta")
+
+    -- Step 3: Generate Alpha
+    local l3, t3, e3 = generate_all_incremental(alpha_2, l2)
+    ok(e3 > 0, "CrossClass3: Alpha edits produced")
+
+    -- Final verification
+    local final_clazzes = parser.parse_classes(t3)
+    local fa, fb, fg
+    for _, c in ipairs(final_clazzes) do
+      if c.name == "Alpha" then fa = c end
+      if c.name == "Beta" then fb = c end
+      if c.name == "Gamma" then fg = c end
+    end
+
+    ok(fa ~= nil, "CrossClass3 Final: Alpha parsed")
+    ok(fb ~= nil, "CrossClass3 Final: Beta parsed")
+    ok(fg ~= nil, "CrossClass3 Final: Gamma parsed")
+
+    if fa and fb and fg then
+      local fa_text = table.concat(l3, "\n", fa.starts_at_line, fa.ends_at_line)
+      local fb_text = table.concat(l3, "\n", fb.starts_at_line, fb.ends_at_line)
+      local fg_text = table.concat(l3, "\n", fg.starts_at_line, fg.ends_at_line)
+
+      -- Alpha should have a1, a2 only
+      ok(fa_text:find("this.a1", 1, true) ~= nil, "CrossClass3 Final: Alpha has a1")
+      ok(fa_text:find("this.a2", 1, true) ~= nil, "CrossClass3 Final: Alpha has a2")
+      ok(fa_text:find("this.b1", 1, true) == nil, "CrossClass3 Final: Alpha NOT b1")
+      ok(fa_text:find("this.g1", 1, true) == nil, "CrossClass3 Final: Alpha NOT g1")
+
+      -- Beta should have b1, b2 only
+      ok(fb_text:find("this.b1", 1, true) ~= nil, "CrossClass3 Final: Beta has b1")
+      ok(fb_text:find("this.b2", 1, true) ~= nil, "CrossClass3 Final: Beta has b2")
+      ok(fb_text:find("this.a1", 1, true) == nil, "CrossClass3 Final: Beta NOT a1")
+      ok(fb_text:find("this.g1", 1, true) == nil, "CrossClass3 Final: Beta NOT g1")
+
+      -- Gamma should have g1, g2 only
+      ok(fg_text:find("this.g1", 1, true) ~= nil, "CrossClass3 Final: Gamma has g1")
+      ok(fg_text:find("this.g2", 1, true) ~= nil, "CrossClass3 Final: Gamma has g2")
+      ok(fg_text:find("this.a1", 1, true) == nil, "CrossClass3 Final: Gamma NOT a1")
+      ok(fg_text:find("this.b1", 1, true) == nil, "CrossClass3 Final: Gamma NOT b1")
+
+      -- toString class names
+      ok(fa_text:find("Alpha(", 1, true) ~= nil, "CrossClass3 Final: Alpha toString")
+      ok(fb_text:find("Beta(", 1, true) ~= nil, "CrossClass3 Final: Beta toString")
+      ok(fg_text:find("Gamma(", 1, true) ~= nil, "CrossClass3 Final: Gamma toString")
+
+      -- Idempotency for all three
+      verify_idempotent(l3, t3, "Alpha")
+      verify_idempotent(l3, t3, "Beta")
+      verify_idempotent(l3, t3, "Gamma")
+    end
+  end
+end
+
+-- ===========================================================================
+-- 24. CROSS-CLASS: Simulating actions.apply_incremental flow
+--     This mirrors the actual Neovim usage: parse full buffer, find class,
+--     generate all for that class, update buffer, repeat for next class.
+-- ===========================================================================
+do
+  local text = [[class Person {
+  final String firstName;
+  final String lastName;
+  final int age;
+}
+
+class Address {
+  final String street;
+  final String city;
+  final String zip;
+}
+]]
+
+  -- Simulate a fake vim buffer (like actions.apply_incremental does)
+  local buf_lines = {}
+  for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+    buf_lines[#buf_lines + 1] = line
+  end
+
+  -- Simulate: user triggers "Generate data class" on Person
+  local clazzes1 = parser.parse_classes(table.concat(buf_lines, "\n"))
+  local person1 = parser.find_class_at_line(clazzes1, 1)
+  ok(person1 ~= nil, "CrossClassSim: Person found at line 1")
+
+  if person1 then
+    local blocks1 = incremental.detect_blocks(person1, buf_lines)
+    local edits1 = {}
+    local all_kinds = { "constructor", "copyWith", "toMap", "fromMap", "toJson", "fromJson", "toString", "equality", "hashCode" }
+    for _, kind in ipairs(all_kinds) do
+      local gen_text
+      if kind == "constructor" then
+        gen_text = generator.generate_constructor(person1)
+      elseif kind == "copyWith" then
+        gen_text = (generator.generate_copy_with(person1))
+      elseif kind == "toMap" then
+        gen_text = generator.generate_to_map(person1)
+      elseif kind == "fromMap" then
+        gen_text = (generator.generate_from_map(person1))
+      elseif kind == "toJson" then
+        gen_text = (generator.generate_to_json(person1))
+      elseif kind == "fromJson" then
+        gen_text = (generator.generate_from_json(person1))
+      elseif kind == "toString" then
+        gen_text = generator.generate_to_string(person1)
+      elseif kind == "equality" then
+        gen_text = (generator.generate_equality(person1))
+      elseif kind == "hashCode" then
+        gen_text = (generator.generate_hash_code(person1))
+      end
+      if gen_text then
+        local edit = incremental.build_edit(kind, person1, blocks1, gen_text)
+        if edit then edits1[#edits1 + 1] = edit end
+      end
+    end
+    buf_lines = incremental.apply_edits(buf_lines, edits1)
+    ok(#edits1 > 0, "CrossClassSim: Person edits produced")
+
+    -- Now simulate: user triggers "Generate data class" on Address
+    -- Re-parse the entire buffer (just like apply_incremental does)
+    local buf_text = table.concat(buf_lines, "\n")
+    local clazzes2 = parser.parse_classes(buf_text)
+
+    -- Find Address. It was originally at line ~7, but Person has grown.
+    -- We need to find it by name now (like the actual code does via find_class_at_line
+    -- with the original starts_at_line from the action).
+    local address2
+    for _, c in ipairs(clazzes2) do
+      if c.name == "Address" then address2 = c; break end
+    end
+    ok(address2 ~= nil, "CrossClassSim: Address found after Person generation")
+
+    if address2 then
+      local blocks2 = incremental.detect_blocks(address2, buf_lines)
+      local edits2 = {}
+      for _, kind in ipairs(all_kinds) do
+        local gen_text
+        if kind == "constructor" then
+          gen_text = generator.generate_constructor(address2)
+        elseif kind == "copyWith" then
+          gen_text = (generator.generate_copy_with(address2))
+        elseif kind == "toMap" then
+          gen_text = generator.generate_to_map(address2)
+        elseif kind == "fromMap" then
+          gen_text = (generator.generate_from_map(address2))
+        elseif kind == "toJson" then
+          gen_text = (generator.generate_to_json(address2))
+        elseif kind == "fromJson" then
+          gen_text = (generator.generate_from_json(address2))
+        elseif kind == "toString" then
+          gen_text = generator.generate_to_string(address2)
+        elseif kind == "equality" then
+          gen_text = (generator.generate_equality(address2))
+        elseif kind == "hashCode" then
+          gen_text = (generator.generate_hash_code(address2))
+        end
+        if gen_text then
+          local edit = incremental.build_edit(kind, address2, blocks2, gen_text)
+          if edit then edits2[#edits2 + 1] = edit end
+        end
+      end
+      buf_lines = incremental.apply_edits(buf_lines, edits2)
+      ok(#edits2 > 0, "CrossClassSim: Address edits produced")
+
+      -- Final verification
+      local final_text = table.concat(buf_lines, "\n")
+      local final_clazzes = parser.parse_classes(final_text)
+      local fp, fa
+      for _, c in ipairs(final_clazzes) do
+        if c.name == "Person" then fp = c end
+        if c.name == "Address" then fa = c end
+      end
+
+      ok(fp ~= nil, "CrossClassSim Final: Person parsed")
+      ok(fa ~= nil, "CrossClassSim Final: Address parsed")
+
+      if fp and fa then
+        local fp_text = table.concat(buf_lines, "\n", fp.starts_at_line, fp.ends_at_line)
+        local fa_text = table.concat(buf_lines, "\n", fa.starts_at_line, fa.ends_at_line)
+
+        -- Person fields
+        ok(fp_text:find("this.firstName", 1, true) ~= nil, "CrossClassSim Final: Person has firstName")
+        ok(fp_text:find("this.lastName", 1, true) ~= nil, "CrossClassSim Final: Person has lastName")
+        ok(fp_text:find("this.age", 1, true) ~= nil, "CrossClassSim Final: Person has age")
+
+        -- Person does NOT have Address fields
+        ok(fp_text:find("this.street", 1, true) == nil, "CrossClassSim Final: Person NOT street")
+        ok(fp_text:find("this.city", 1, true) == nil, "CrossClassSim Final: Person NOT city")
+        ok(fp_text:find("this.zip", 1, true) == nil, "CrossClassSim Final: Person NOT zip")
+
+        -- Address fields
+        ok(fa_text:find("this.street", 1, true) ~= nil, "CrossClassSim Final: Address has street")
+        ok(fa_text:find("this.city", 1, true) ~= nil, "CrossClassSim Final: Address has city")
+        ok(fa_text:find("this.zip", 1, true) ~= nil, "CrossClassSim Final: Address has zip")
+
+        -- Address does NOT have Person fields
+        ok(fa_text:find("this.firstName", 1, true) == nil, "CrossClassSim Final: Address NOT firstName")
+        ok(fa_text:find("this.lastName", 1, true) == nil, "CrossClassSim Final: Address NOT lastName")
+        ok(fa_text:find("this.age", 1, true) == nil, "CrossClassSim Final: Address NOT age")
+
+        -- Class names in toString
+        ok(fp_text:find("Person(", 1, true) ~= nil, "CrossClassSim Final: Person toString")
+        ok(fa_text:find("Address(", 1, true) ~= nil, "CrossClassSim Final: Address toString")
+
+        -- toMap keys
+        ok(fp_text:find("'firstName'", 1, true) ~= nil or fp_text:find("'first_name'", 1, true) ~= nil,
+          "CrossClassSim Final: Person toMap firstName key")
+        ok(fa_text:find("'street'", 1, true) ~= nil, "CrossClassSim Final: Address toMap street key")
+        ok(fa_text:find("'firstName'", 1, true) == nil and fa_text:find("'first_name'", 1, true) == nil,
+          "CrossClassSim Final: Address toMap NOT firstName key")
+
+        -- Equality type checks
+        ok(fp_text:find("is Person", 1, true) ~= nil or fp_text:find("is! Person", 1, true) ~= nil,
+          "CrossClassSim Final: Person equality check")
+        ok(fa_text:find("is Address", 1, true) ~= nil or fa_text:find("is! Address", 1, true) ~= nil,
+          "CrossClassSim Final: Address equality check")
+
+        -- Idempotency
+        verify_idempotent(buf_lines, final_text, "Person")
+        verify_idempotent(buf_lines, final_text, "Address")
+
+        -- Print the final output for debugging if needed
+        -- io.write("\n--- FINAL OUTPUT ---\n" .. final_text .. "\n--- END ---\n")
+      end
+    end
+  end
+end
+
+-- ===========================================================================
+-- 25. FULL ACTIONS INTEGRATION: Simulate actions.apply_incremental with
+--     fake vim.api buffer to test the exact code path used in Neovim.
+-- ===========================================================================
+io.write("\n=== Full Actions Integration Tests (simulated vim.api) ===\n")
+do
+  local actions_mod = require("dart-class-tools.actions")
+
+  -- Create a fake buffer that mimics vim.api behavior
+  local function make_fake_buffer(initial_text)
+    local buf_lines = {}
+    for line in (initial_text .. "\n"):gmatch("([^\n]*)\n") do
+      buf_lines[#buf_lines + 1] = line
+    end
+
+    local bufnr = 999 -- fake buffer number
+    local notifications = {}
+
+    -- Install fake vim.api functions
+    vim.api = vim.api or {}
+    vim.notify = function(msg, level)
+      notifications[#notifications + 1] = { msg = msg, level = level }
+    end
+
+    vim.api.nvim_buf_line_count = function(b)
+      if b == bufnr then return #buf_lines end
+      return 0
+    end
+
+    vim.api.nvim_buf_get_lines = function(b, start_idx, end_idx, strict)
+      if b ~= bufnr then return {} end
+      local result = {}
+      -- 0-indexed API: start_idx is inclusive, end_idx is exclusive
+      for i = start_idx + 1, end_idx do
+        result[#result + 1] = buf_lines[i] or ""
+      end
+      return result
+    end
+
+    vim.api.nvim_buf_set_lines = function(b, start_idx, end_idx, strict, replacement)
+      if b ~= bufnr then return end
+      -- 0-indexed API: remove lines from start_idx to end_idx-1, insert replacement
+      local new_buf = {}
+      for i = 1, start_idx do
+        new_buf[#new_buf + 1] = buf_lines[i]
+      end
+      for _, l in ipairs(replacement) do
+        new_buf[#new_buf + 1] = l
+      end
+      for i = end_idx + 1, #buf_lines do
+        new_buf[#new_buf + 1] = buf_lines[i]
+      end
+      buf_lines = new_buf
+    end
+
+    return bufnr, buf_lines, notifications, function() return buf_lines end
+  end
+
+  -- Test: Two classes, generate data class for each sequentially
+  local initial_text = [[class User {
+  final String name;
+  final int age;
+}
+
+class Product {
+  final String title;
+  final double price;
+}]]
+
+  local bufnr, _, notifications, get_buf = make_fake_buffer(initial_text)
+
+  -- Step 1: Get code actions for User (line 1)
+  local user_actions = actions_mod.get_code_actions(bufnr, 1)
+  ok(#user_actions > 0, "ActionsInteg: User has code actions")
+
+  -- Find the data class action
+  local user_dc_action
+  for _, a in ipairs(user_actions) do
+    if a.title:find("data class", 1, true) then
+      user_dc_action = a
+      break
+    end
+  end
+  ok(user_dc_action ~= nil, "ActionsInteg: User has data class action")
+
+  if user_dc_action then
+    -- Execute it
+    actions_mod.execute_action(user_dc_action)
+
+    local buf_after_user = get_buf()
+    local text_after_user = table.concat(buf_after_user, "\n")
+
+    -- Verify User was generated
+    ok(text_after_user:find("this.name", 1, true) ~= nil, "ActionsInteg: User generated - has this.name")
+    ok(text_after_user:find("this.age", 1, true) ~= nil, "ActionsInteg: User generated - has this.age")
+
+    -- Step 2: Now get code actions for Product (need to find its new line)
+    local product_line
+    for i, l in ipairs(buf_after_user) do
+      if l:match("^class Product") then
+        product_line = i
+        break
+      end
+    end
+    ok(product_line ~= nil, "ActionsInteg: Product class line found")
+
+    if product_line then
+      local product_actions = actions_mod.get_code_actions(bufnr, product_line)
+      ok(#product_actions > 0, "ActionsInteg: Product has code actions")
+
+      local product_dc_action
+      for _, a in ipairs(product_actions) do
+        if a.title:find("data class", 1, true) then
+          product_dc_action = a
+          break
+        end
+      end
+      ok(product_dc_action ~= nil, "ActionsInteg: Product has data class action")
+
+      if product_dc_action then
+        -- Execute it
+        actions_mod.execute_action(product_dc_action)
+
+        local buf_final = get_buf()
+        local text_final = table.concat(buf_final, "\n")
+
+        -- Re-parse to get class boundaries
+        local final_clazzes = parser.parse_classes(text_final)
+        local fu, fp
+        for _, c in ipairs(final_clazzes) do
+          if c.name == "User" then fu = c end
+          if c.name == "Product" then fp = c end
+        end
+
+        ok(fu ~= nil, "ActionsInteg Final: User parsed")
+        ok(fp ~= nil, "ActionsInteg Final: Product parsed")
+
+        if fu and fp then
+          local fu_text = table.concat(buf_final, "\n", fu.starts_at_line, fu.ends_at_line)
+          local fp_text = table.concat(buf_final, "\n", fp.starts_at_line, fp.ends_at_line)
+
+          -- User should have ONLY User fields
+          ok(fu_text:find("this.name", 1, true) ~= nil, "ActionsInteg Final: User has name")
+          ok(fu_text:find("this.age", 1, true) ~= nil, "ActionsInteg Final: User has age")
+          ok(fu_text:find("this.title", 1, true) == nil, "ActionsInteg Final: User NOT title")
+          ok(fu_text:find("this.price", 1, true) == nil, "ActionsInteg Final: User NOT price")
+          ok(fu_text:find("User(", 1, true) ~= nil, "ActionsInteg Final: User toString User(")
+
+          -- Product should have ONLY Product fields
+          ok(fp_text:find("this.title", 1, true) ~= nil, "ActionsInteg Final: Product has title")
+          ok(fp_text:find("this.price", 1, true) ~= nil, "ActionsInteg Final: Product has price")
+          ok(fp_text:find("this.name", 1, true) == nil, "ActionsInteg Final: Product NOT name")
+          ok(fp_text:find("this.age", 1, true) == nil, "ActionsInteg Final: Product NOT age")
+          ok(fp_text:find("Product(", 1, true) ~= nil, "ActionsInteg Final: Product toString Product(")
+
+          -- Cross-check: class names don't leak
+          ok(fu_text:find("Product copyWith", 1, true) == nil, "ActionsInteg Final: User NOT Product copyWith")
+          ok(fp_text:find("User copyWith", 1, true) == nil, "ActionsInteg Final: Product NOT User copyWith")
+
+          -- Idempotency via actions: re-executing should produce "no changes needed"
+          notifications = {}
+          actions_mod.execute_action(product_dc_action)
+          -- Note: this uses the old product_dc_action which has stale starts_at_line.
+          -- The re-parse in apply_incremental should handle this... or should it?
+          -- This specifically tests whether stale line numbers cause issues.
+
+          -- Actually let's get fresh actions to test idempotency properly
+          local product_actions_2 = actions_mod.get_code_actions(bufnr, fp.starts_at_line)
+          -- If truly idempotent, there should be no data class action (all complete)
+          local has_dc = false
+          for _, a in ipairs(product_actions_2) do
+            if a.title:find("data class", 1, true) then
+              has_dc = true
+              break
+            end
+          end
+          -- NOTE: has_dc might be true if "Regenerate" is shown. Check for "Generate" specifically.
+          local has_generate = false
+          for _, a in ipairs(product_actions_2) do
+            if a.title == "Generate data class" then
+              has_generate = true
+              break
+            end
+          end
+          ok(not has_generate, "ActionsInteg: Product no 'Generate data class' after generation (idempotent)")
+        end
+      end
+    end
+  end
+
+  -- Clean up fake vim.api to not interfere with other tests
+  vim.api = nil
+  vim.notify = nil
+end
+
+-- ===========================================================================
+-- 26. STALE LINE NUMBER: Test that stale starts_at_line in action doesn't
+--     cause cross-class contamination
+-- ===========================================================================
+do
+  io.write("\n=== Stale Line Number Tests ===\n")
+
+  local initial_text = [[class Foo {
+  final String x;
+}
+
+class Bar {
+  final int y;
+}]]
+
+  local lines = {}
+  for line in (initial_text .. "\n"):gmatch("([^\n]*)\n") do
+    lines[#lines + 1] = line
+  end
+
+  -- Parse initially
+  local clazzes = parser.parse_classes(initial_text)
+  local foo_clazz, bar_clazz
+  for _, c in ipairs(clazzes) do
+    if c.name == "Foo" then foo_clazz = c end
+    if c.name == "Bar" then bar_clazz = c end
+  end
+
+  ok(foo_clazz ~= nil, "StaleLineNum: Foo parsed")
+  ok(bar_clazz ~= nil, "StaleLineNum: Bar parsed")
+
+  if foo_clazz and bar_clazz then
+    -- Record Bar's original starts_at_line
+    local bar_original_line = bar_clazz.starts_at_line
+    ok(bar_original_line ~= nil, "StaleLineNum: Bar starts_at_line recorded = " .. tostring(bar_original_line))
+
+    -- Generate all for Foo (this shifts Bar's position)
+    local new_lines, new_text, edits = generate_all_incremental(foo_clazz, lines)
+    ok(edits > 0, "StaleLineNum: Foo generation produced edits")
+
+    -- Find Bar's NEW position
+    local new_clazzes = parser.parse_classes(new_text)
+    local new_bar
+    for _, c in ipairs(new_clazzes) do
+      if c.name == "Bar" then new_bar = c; break end
+    end
+    ok(new_bar ~= nil, "StaleLineNum: Bar found after Foo generation")
+    if new_bar then
+      ok(new_bar.starts_at_line > bar_original_line,
+        "StaleLineNum: Bar shifted from " .. bar_original_line .. " to " .. new_bar.starts_at_line)
+
+      -- Now try to find a class at the OLD Bar line number
+      -- This should find Foo (which now extends to cover that line)
+      local wrong_class = parser.find_class_at_line(new_clazzes, bar_original_line)
+      if wrong_class then
+        ok(wrong_class.name == "Foo",
+          "StaleLineNum: stale line " .. bar_original_line .. " now inside Foo (name=" .. wrong_class.name .. ")")
+      else
+        ok(true, "StaleLineNum: stale line " .. bar_original_line .. " finds no class")
+      end
+
+      -- The correct behavior: if we use Bar's stale line, we'd find Foo and
+      -- generate Foo's methods instead of Bar's. This IS the contamination bug.
+      -- Let's verify by generating with the stale reference
+      local stale_clazz = parser.find_class_at_line(new_clazzes, bar_original_line)
+      if stale_clazz and stale_clazz.name ~= "Bar" then
+        ok(true, "StaleLineNum: CONFIRMED - stale line resolves to " .. stale_clazz.name .. " instead of Bar")
+        -- This proves the contamination mechanism: if an action carries a stale
+        -- starts_at_line, apply_incremental will find the WRONG class
+      end
+
+      -- VERIFY FIX: find_class_by_name resolves correctly regardless of line shifts
+      local correct_bar = parser.find_class_by_name(new_clazzes, "Bar")
+      ok(correct_bar ~= nil, "StaleLineNum FIX: find_class_by_name finds Bar")
+      if correct_bar then
+        eq(correct_bar.name, "Bar", "StaleLineNum FIX: correct class name")
+        ok(correct_bar.starts_at_line > bar_original_line,
+          "StaleLineNum FIX: Bar at correct shifted position " .. correct_bar.starts_at_line)
+      end
+    end
+  end
+end
+
+-- ===========================================================================
+-- 27. STALE ACTION VIA ACTIONS MODULE: Simulate the exact scenario where
+--     a stale action (with old starts_at_line) is executed after another
+--     class was generated. The find_class_by_name fix should prevent
+--     contamination.
+-- ===========================================================================
+do
+  io.write("\n=== Stale Action Fix Tests ===\n")
+
+  local actions_mod = require("dart-class-tools.actions")
+
+  local initial_text = [[class First {
+  final String a;
+  final int b;
+}
+
+class Second {
+  final String x;
+  final double y;
+}]]
+
+  -- Create a fake buffer
+  local buf_lines = {}
+  for line in (initial_text .. "\n"):gmatch("([^\n]*)\n") do
+    buf_lines[#buf_lines + 1] = line
+  end
+  local bufnr = 998
+  local notifications = {}
+
+  vim.api = vim.api or {}
+  vim.notify = function(msg, level)
+    notifications[#notifications + 1] = { msg = msg, level = level }
+  end
+  vim.api.nvim_buf_line_count = function(b)
+    if b == bufnr then return #buf_lines end
+    return 0
+  end
+  vim.api.nvim_buf_get_lines = function(b, start_idx, end_idx, strict)
+    if b ~= bufnr then return {} end
+    local result = {}
+    for i = start_idx + 1, end_idx do
+      result[#result + 1] = buf_lines[i] or ""
+    end
+    return result
+  end
+  vim.api.nvim_buf_set_lines = function(b, start_idx, end_idx, strict, replacement)
+    if b ~= bufnr then return end
+    local new_buf = {}
+    for i = 1, start_idx do
+      new_buf[#new_buf + 1] = buf_lines[i]
+    end
+    for _, l in ipairs(replacement) do
+      new_buf[#new_buf + 1] = l
+    end
+    for i = end_idx + 1, #buf_lines do
+      new_buf[#new_buf + 1] = buf_lines[i]
+    end
+    buf_lines = new_buf
+  end
+
+  -- Step 1: Get code actions for BOTH classes BEFORE any generation
+  local first_actions = actions_mod.get_code_actions(bufnr, 1)
+  local second_line
+  for i, l in ipairs(buf_lines) do
+    if l:match("^class Second") then second_line = i; break end
+  end
+  local second_actions = actions_mod.get_code_actions(bufnr, second_line)
+
+  local first_dc, second_dc
+  for _, a in ipairs(first_actions) do
+    if a.title:find("data class", 1, true) then first_dc = a; break end
+  end
+  for _, a in ipairs(second_actions) do
+    if a.title:find("data class", 1, true) then second_dc = a; break end
+  end
+
+  ok(first_dc ~= nil, "StaleAction: First has data class action")
+  ok(second_dc ~= nil, "StaleAction: Second has data class action")
+
+  if first_dc and second_dc then
+    -- Record Second's starts_at_line from the action
+    local second_stale_line = second_dc.clazz.starts_at_line
+    ok(second_stale_line ~= nil, "StaleAction: Second starts_at_line = " .. tostring(second_stale_line))
+
+    -- Step 2: Execute First's action → this expands First and shifts Second
+    actions_mod.execute_action(first_dc)
+    local text_after_first = table.concat(buf_lines, "\n")
+    ok(text_after_first:find("this.a", 1, true) ~= nil, "StaleAction: First generated")
+
+    -- Verify Second shifted
+    local new_second_line
+    for i, l in ipairs(buf_lines) do
+      if l:match("^class Second") then new_second_line = i; break end
+    end
+    ok(new_second_line ~= nil, "StaleAction: Second still exists")
+    if new_second_line then
+      ok(new_second_line > second_stale_line,
+        "StaleAction: Second shifted from " .. second_stale_line .. " to " .. new_second_line)
+    end
+
+    -- Step 3: Execute the STALE second action (with old starts_at_line).
+    -- With the find_class_by_name fix, this should still find Second correctly.
+    actions_mod.execute_action(second_dc)
+    local text_final = table.concat(buf_lines, "\n")
+
+    -- Verify: Second should have its own fields, NOT First's fields
+    local final_clazzes = parser.parse_classes(text_final)
+    local f_first, f_second
+    for _, c in ipairs(final_clazzes) do
+      if c.name == "First" then f_first = c end
+      if c.name == "Second" then f_second = c end
+    end
+
+    ok(f_first ~= nil, "StaleAction Final: First parsed")
+    ok(f_second ~= nil, "StaleAction Final: Second parsed")
+
+    if f_first and f_second then
+      local first_text = table.concat(buf_lines, "\n", f_first.starts_at_line, f_first.ends_at_line)
+      local second_text = table.concat(buf_lines, "\n", f_second.starts_at_line, f_second.ends_at_line)
+
+      -- First should have a, b
+      ok(first_text:find("this.a", 1, true) ~= nil, "StaleAction Final: First has a")
+      ok(first_text:find("this.b", 1, true) ~= nil, "StaleAction Final: First has b")
+      ok(first_text:find("this.x", 1, true) == nil, "StaleAction Final: First NOT x")
+      ok(first_text:find("this.y", 1, true) == nil, "StaleAction Final: First NOT y")
+
+      -- Second should have x, y (NOT a, b from First!)
+      ok(second_text:find("this.x", 1, true) ~= nil, "StaleAction Final: Second has x")
+      ok(second_text:find("this.y", 1, true) ~= nil, "StaleAction Final: Second has y")
+      ok(second_text:find("this.a", 1, true) == nil, "StaleAction Final: Second NOT a")
+      ok(second_text:find("this.b", 1, true) == nil, "StaleAction Final: Second NOT b")
+
+      -- Class names
+      ok(first_text:find("First(", 1, true) ~= nil, "StaleAction Final: First toString")
+      ok(second_text:find("Second(", 1, true) ~= nil, "StaleAction Final: Second toString")
+      ok(second_text:find("First(", 1, true) == nil, "StaleAction Final: Second NOT First toString")
+
+      -- Idempotency
+      local idem_actions = actions_mod.get_code_actions(bufnr, f_second.starts_at_line)
+      local has_generate = false
+      for _, a in ipairs(idem_actions) do
+        if a.title == "Generate data class" then has_generate = true; break end
+      end
+      ok(not has_generate, "StaleAction Final: Second idempotent (no Generate)")
+    end
+  end
+
+  -- Clean up
+  vim.api = nil
+  vim.notify = nil
+end
+
 --------------------------------------------------------------------------------
 -- Summary
 --------------------------------------------------------------------------------

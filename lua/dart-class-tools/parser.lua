@@ -722,6 +722,21 @@ function M.find_class_at_line(clazzes, line_nr)
   return nil
 end
 
+--- Find a class/enum by name.
+--- When multiple classes share the same name (unlikely but possible), returns
+--- the first match.  Falls back to nil if not found.
+---@param clazzes DartClass[]
+---@param name string
+---@return DartClass|nil
+function M.find_class_by_name(clazzes, name)
+  for _, clazz in ipairs(clazzes) do
+    if clazz.name == name then
+      return clazz
+    end
+  end
+  return nil
+end
+
 --- Check if cursor is on a valid position for code actions.
 ---@param clazz DartClass
 ---@param line_nr number 1-indexed
@@ -743,18 +758,6 @@ function M.is_valid_action_position(clazz, line_nr)
     and line_nr <= clazz.constr_ends_at_line
 
   return is_at_class_decl or is_in_properties or is_in_constr
-end
-
---- Check if a method exists in the class content.
----@param clazz DartClass
----@param finder string method signature to search for
----@return boolean
-function M.method_exists(clazz, finder)
-  if not clazz or not clazz.class_content then return false end
-  -- Normalize: strip whitespace for comparison
-  local norm_finder = finder:gsub("%s+", "")
-  local norm_content = clazz.class_content:gsub("%s+", "")
-  return norm_content:find(norm_finder, 1, true) ~= nil
 end
 
 return M

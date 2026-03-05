@@ -160,8 +160,8 @@ end
 --- Apply incremental edits for the given kind(s) to a buffer.
 --- This is the main entry point for executing actions.
 ---@param bufnr number
----@param clazz DartClass
----@param kinds string[] list of kinds to generate/update
+---@param clazz DartClass the class from the action (may be stale/serialized — only .name is used)
+---@param kinds string[]|nil list of kinds to generate/update, or nil for "data class" (all applicable)
 local function apply_incremental(bufnr, clazz, kinds)
   -- Re-parse to get fresh state
   local line_count = vim.api.nvim_buf_line_count(bufnr)
@@ -171,13 +171,35 @@ local function apply_incremental(bufnr, clazz, kinds)
   local lines_1 = {}
   for i, l in ipairs(buf_lines) do lines_1[i] = l end
 
-  -- Re-parse the file to get fresh class state
+  -- Re-parse the file to get fresh class state.
+  -- Use class NAME (not starts_at_line) to find the correct class.
+  -- starts_at_line can become stale if the buffer was modified between
+  -- action creation and execution (e.g., another class was generated first,
+  -- shifting line numbers).  The class name is a plain string that is
+  -- always stable and survives LSP argument serialization.
   local text = table.concat(buf_lines, "\n")
   local clazzes = parser.parse_classes(text)
-  local fresh_clazz = parser.find_class_at_line(clazzes, clazz.starts_at_line)
-  if not fresh_clazz or not fresh_clazz:is_valid() then
-    vim.notify("dart-class-tools: could not re-parse class", vim.log.levels.WARN)
+  local class_name = clazz.name
+  if not class_name then
+    vim.notify("dart-class-tools: action has no class name", vim.log.levels.WARN)
     return
+  end
+  local fresh_clazz = parser.find_class_by_name(clazzes, class_name)
+  if not fresh_clazz or not fresh_clazz:is_valid() then
+    vim.notify("dart-class-tools: could not re-parse class '" .. class_name .. "'", vim.log.levels.WARN)
+    return
+  end
+
+  -- If kinds is nil, compute all applicable kinds from the fresh class.
+  -- This avoids calling metatable methods on the potentially stale/serialized
+  -- action.clazz object (which may have lost its metatable during LSP
+  -- argument serialization).
+  if not kinds then
+    local ak = applicable_kinds(fresh_clazz)
+    kinds = {}
+    for _, kind in ipairs(ALL_KINDS) do
+      if ak[kind] then kinds[#kinds + 1] = kind end
+    end
   end
 
   -- Detect existing blocks
@@ -200,27 +222,15 @@ local function apply_incremental(bufnr, clazz, kinds)
       local edit = incremental.build_edit(kind, fresh_clazz, blocks, gen_text)
       if edit then
         edits[#edits + 1] = edit
-        -- After inserting, update blocks table for subsequent kinds' insertion points
-        -- We fake a block entry so the next kind knows where to insert after
-        if edit.action == "insert_after" then
-          local new_end = edit.start_line + #edit.new_lines
-          blocks[kind] = {
-            kind = kind,
-            start_line = edit.start_line + 1,
-            end_line = new_end,
-            fields = incremental.get_class_field_names(fresh_clazz),
-            text = gen_text,
-          }
-        else
-          -- Replace: update block entry
-          blocks[kind] = {
-            kind = kind,
-            start_line = edit.start_line,
-            end_line = edit.start_line + #edit.new_lines - 1,
-            fields = incremental.get_class_field_names(fresh_clazz),
-            text = gen_text,
-          }
-        end
+        -- NOTE: We do NOT mutate `blocks` with faked entries here.
+        -- All insert_after edits for absent blocks target the same start_line
+        -- (props_end or the end of the last preceding block in original buffer space).
+        -- apply_edits() sorts by start_line DESC with canonical order DESC tiebreaker,
+        -- which correctly stacks multiple inserts at the same point.
+        --
+        -- For "replace" edits on existing blocks, the block already exists in the
+        -- blocks table and subsequent kinds' insert points are unaffected since
+        -- replacements don't shift line numbers in the original buffer coordinate space.
       end
       for _, imp in ipairs(imports) do add_import(imp) end
     end
@@ -409,13 +419,10 @@ function M.execute_action(action)
     -- Specific kinds requested
     apply_incremental(bufnr, clazz, action.action_kinds)
   else
-    -- Data class: generate all applicable kinds
-    local kinds = applicable_kinds(clazz)
-    local ordered = {}
-    for _, kind in ipairs(ALL_KINDS) do
-      if kinds[kind] then ordered[#ordered + 1] = kind end
-    end
-    apply_incremental(bufnr, clazz, ordered)
+    -- Data class: generate all applicable kinds.
+    -- Pass nil for kinds — apply_incremental will compute them from the
+    -- fresh class (not the potentially stale/serialized action.clazz).
+    apply_incremental(bufnr, clazz, nil)
   end
 end
 
