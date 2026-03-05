@@ -138,8 +138,9 @@ end
 --- Generate the text for a single kind, returning the generated text and imports.
 ---@param clazz DartClass
 ---@param kind string
+---@param blocks table<string, MethodBlock>|nil detected blocks (used for style preservation)
 ---@return string|nil text, string[] imports
-local function generate_kind(clazz, kind)
+local function generate_kind(clazz, kind, blocks)
   local imports = {}
   local text
 
@@ -174,7 +175,7 @@ local function generate_kind(clazz, kind)
     text = t
     imports = imps or {}
   elseif kind == "props" then
-    text = generator.generate_props(clazz)
+    text = generator.generate_props(clazz, blocks and blocks.props or nil)
   end
 
   return text, imports
@@ -240,7 +241,7 @@ local function apply_incremental(bufnr, clazz, kinds)
   end
 
   for _, kind in ipairs(kinds) do
-    local gen_text, imports = generate_kind(fresh_clazz, kind)
+    local gen_text, imports = generate_kind(fresh_clazz, kind, blocks)
     if gen_text then
       local edit = incremental.build_edit(kind, fresh_clazz, blocks, gen_text)
       if edit then
@@ -511,5 +512,6 @@ M.applicable_kinds = applicable_kinds
 M.get_all_statuses = get_all_statuses
 M.apply_incremental = apply_incremental
 M.generate_kind = generate_kind
+M.action_title = action_title
 
 return M

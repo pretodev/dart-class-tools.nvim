@@ -451,11 +451,35 @@ function M.detect_blocks(clazz, buf_lines)
       goto continue
     end
 
-    -- props (has @override) — Equatable props getter
-    if has_override and check_line:match("List<Object%?>%s+get%s+props") then
-      local sig_line_idx = block_start + 1
-      while sig_line_idx <= stop and utils.trim(buf_lines[sig_line_idx]) == "" do
-        sig_line_idx = sig_line_idx + 1
+    -- props — Equatable props (getter, field, or method) with or without @override
+    --
+    -- Detect ALL forms:
+    --   Getter:  List<Object?> get props => ...  /  List<Object?> get props { ... }
+    --   Field:   final List<Object?> props = ...;  /  final props = ...;  /  late final List<Object?> props;
+    --   Method:  List<Object?> props() => ...  /  List<Object?> props() { ... }  /  props() => ...
+    -- Each may or may not have @override.
+    local props_style = nil -- "getter" | "field" | "method"
+    if check_line:match("List<Object%?>%s+get%s+props")
+      or check_line:match("get%s+props%s*=>")
+      or check_line:match("get%s+props%s*{") then
+      props_style = "getter"
+    elseif check_line:match("final%s+List<Object%?>%s+props%s*=")
+      or check_line:match("final%s+props%s*=")
+      or check_line:match("late%s+final%s+List<Object%?>%s+props")
+      or check_line:match("final%s+List<Object%?>%s+props%s*;") then
+      props_style = "field"
+    elseif check_line:match("List<Object%?>%s+props%s*%(")
+      or check_line:match("^props%s*%(") then
+      props_style = "method"
+    end
+
+    if props_style then
+      local sig_line_idx = block_start
+      if has_override then
+        sig_line_idx = block_start + 1
+        while sig_line_idx <= stop and utils.trim(buf_lines[sig_line_idx]) == "" do
+          sig_line_idx = sig_line_idx + 1
+        end
       end
       local end_line = find_method_end(buf_lines, sig_line_idx)
       local text_lines = {}
@@ -469,6 +493,8 @@ function M.detect_blocks(clazz, buf_lines)
         end_line = end_line,
         fields = extract_props_fields(text),
         text = text,
+        props_style = props_style,
+        has_override = has_override,
       }
       i = end_line + 1
       goto continue

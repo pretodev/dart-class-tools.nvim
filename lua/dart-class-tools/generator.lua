@@ -512,17 +512,47 @@ end
 -- Equatable props
 --------------------------------------------------------------------------------
 
+--- Generate or update Equatable props.
+--- When `existing_block` is provided, preserves the original implementation style
+--- (getter/field/method) and @override presence by replacing only the [...] content.
+--- When absent, generates the default: `@override\n  List<Object?> get props => [...];`
 ---@param clazz DartClass
+---@param existing_block MethodBlock|nil existing props block with .props_style and .has_override
 ---@return string
-function M.generate_props(clazz)
+function M.generate_props(clazz, existing_block)
   local props = clazz:gen_properties()
-  local fields = {}
+  local field_names = {}
   for _, p in ipairs(props) do
-    fields[#fields + 1] = p.name
+    field_names[#field_names + 1] = p.name
+  end
+  local fields_str = table.concat(field_names, ", ")
+
+  -- If we have an existing block, try to preserve its style by replacing [...] content
+  if existing_block and existing_block.text then
+    local text = existing_block.text
+    -- Try to replace the array content inside [ ... ]
+    -- Pattern: find the first [ and the matching ], replace content between them
+    local before_bracket = text:match("^(.-%[)")
+    local after_bracket = text:match("%](.-) *$")
+    if before_bracket and after_bracket then
+      return before_bracket .. fields_str .. "]" .. after_bracket
+    end
+
+    -- Edge case: late final with no initializer (e.g. "late final List<Object?> props;")
+    -- Convert to a field with initializer
+    if text:match("late%s+final%s+List<Object%?>%s+props%s*;") then
+      local indent = text:match("^(%s*)")
+      local override_prefix = ""
+      if existing_block.has_override then
+        override_prefix = indent .. "@override\n"
+      end
+      return override_prefix .. indent .. "final List<Object?> props = [" .. fields_str .. "];"
+    end
   end
 
+  -- Default: generate fresh getter with @override
   local method = "  @override\n"
-  method = method .. "  List<Object?> get props => [" .. table.concat(fields, ", ") .. "];"
+  method = method .. "  List<Object?> get props => [" .. fields_str .. "];"
   return method
 end
 

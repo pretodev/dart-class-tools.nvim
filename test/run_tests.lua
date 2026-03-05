@@ -1789,6 +1789,8 @@ local function generate_all_incremental(clazz, lines, kinds)
       gen_text = (generator.generate_equality(clazz))
     elseif kind == "hashCode" then
       gen_text = (generator.generate_hash_code(clazz))
+    elseif kind == "props" then
+      gen_text = generator.generate_props(clazz, blocks.props)
     end
     if gen_text then
       local edit = incremental.build_edit(kind, clazz, blocks, gen_text)
@@ -1836,6 +1838,8 @@ local function verify_idempotent(new_lines, new_text, class_name, kinds)
       gen_text = (generator.generate_equality(r2_clazz))
     elseif kind == "hashCode" then
       gen_text = (generator.generate_hash_code(r2_clazz))
+    elseif kind == "props" then
+      gen_text = generator.generate_props(r2_clazz, r2_blocks.props)
     end
     if gen_text then
       local edit = incremental.build_edit(kind, r2_clazz, r2_blocks, gen_text)
@@ -3572,6 +3576,8 @@ local function apply_single_action(buf_lines, class_name, kind)
     gen_text = (generator.generate_equality(clazz))
   elseif kind == "hashCode" then
     gen_text = (generator.generate_hash_code(clazz))
+  elseif kind == "props" then
+    gen_text = generator.generate_props(clazz, blocks.props)
   end
 
   if not gen_text then
@@ -3928,13 +3934,18 @@ local function apply_update_existing(buf_lines, class_name)
 
   -- Collect kinds that already exist and have field mismatches
   local update_kinds = {}
-  local all_kinds = { "constructor", "copyWith", "toMap", "fromMap", "toJson", "fromJson", "toString", "equality", "hashCode" }
+  local all_kinds = { "constructor", "copyWith", "toMap", "fromMap", "toJson", "fromJson", "toString", "equality", "hashCode", "props" }
   for _, kind in ipairs(all_kinds) do
     local block = blocks[kind]
     if block then
       if kind == "toJson" or kind == "fromJson" then
         -- Wrappers: no field tracking, but include if underlying map method is being updated
         -- (handled below)
+      elseif kind == "props" then
+        local status = incremental.props_status(block, class_fields)
+        if status == "stale" then
+          update_kinds[#update_kinds + 1] = kind
+        end
       else
         if incremental.has_field_mismatch(block, class_fields) then
           update_kinds[#update_kinds + 1] = kind
@@ -3978,6 +3989,8 @@ local function apply_update_existing(buf_lines, class_name)
       gen_text = (generator.generate_equality(clazz))
     elseif kind == "hashCode" then
       gen_text = (generator.generate_hash_code(clazz))
+    elseif kind == "props" then
+      gen_text = generator.generate_props(clazz, blocks.props)
     end
     if gen_text then
       local edit = incremental.build_edit(kind, clazz, blocks, gen_text)
@@ -5603,9 +5616,857 @@ class RegClass {
   end
 end
 
---------------------------------------------------------------------------------
--- Summary
---------------------------------------------------------------------------------
+-- ===========================================================================
+-- 16. Props detection: all forms (getter/field/method, with/without @override)
+-- ===========================================================================
+io.write("\n--- Props detection: all forms ---\n")
+
+-- 16a. Getter with @override (arrow) — already the default, ensure metadata
+do
+  local text = [[class A extends Equatable {
+  final String name;
+  final int age;
+
+  @override
+  List<Object?> get props => [name, age];
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Props detect getter+override: parsed")
+  if clazz then
+    local blocks = incremental.detect_blocks(clazz, lines)
+    ok(blocks.props ~= nil, "Props detect getter+override: detected")
+    if blocks.props then
+      eq(blocks.props.props_style, "getter", "Props detect getter+override: style=getter")
+      eq(blocks.props.has_override, true, "Props detect getter+override: has_override=true")
+      eq(#blocks.props.fields, 2, "Props detect getter+override: 2 fields")
+      eq(blocks.props.fields[1], "name", "Props detect getter+override: field[1]=name")
+      eq(blocks.props.fields[2], "age", "Props detect getter+override: field[2]=age")
+    end
+  end
+end
+
+-- 16b. Getter WITHOUT @override (arrow)
+do
+  local text = [[class B extends Equatable {
+  final String name;
+
+  List<Object?> get props => [name];
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Props detect getter no override: parsed")
+  if clazz then
+    local blocks = incremental.detect_blocks(clazz, lines)
+    ok(blocks.props ~= nil, "Props detect getter no override: detected")
+    if blocks.props then
+      eq(blocks.props.props_style, "getter", "Props detect getter no override: style=getter")
+      eq(blocks.props.has_override, false, "Props detect getter no override: has_override=false")
+      eq(#blocks.props.fields, 1, "Props detect getter no override: 1 field")
+    end
+  end
+end
+
+-- 16c. Getter with block body { return [...]; }
+do
+  local text = [[class C extends Equatable {
+  final String name;
+  final int age;
+
+  @override
+  List<Object?> get props {
+    return [name, age];
+  }
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Props detect getter block: parsed")
+  if clazz then
+    local blocks = incremental.detect_blocks(clazz, lines)
+    ok(blocks.props ~= nil, "Props detect getter block: detected")
+    if blocks.props then
+      eq(blocks.props.props_style, "getter", "Props detect getter block: style=getter")
+      eq(blocks.props.has_override, true, "Props detect getter block: has_override=true")
+      eq(#blocks.props.fields, 2, "Props detect getter block: 2 fields")
+    end
+  end
+end
+
+-- 16d. Field: final List<Object?> props = [...];
+do
+  local text = [[class D extends Equatable {
+  final String name;
+  final int age;
+
+  @override
+  final List<Object?> props = [name, age];
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Props detect field: parsed")
+  if clazz then
+    local blocks = incremental.detect_blocks(clazz, lines)
+    ok(blocks.props ~= nil, "Props detect field: detected")
+    if blocks.props then
+      eq(blocks.props.props_style, "field", "Props detect field: style=field")
+      eq(blocks.props.has_override, true, "Props detect field: has_override=true")
+      eq(#blocks.props.fields, 2, "Props detect field: 2 fields")
+    end
+  end
+end
+
+-- 16e. Field without @override
+do
+  local text = [[class E extends Equatable {
+  final String name;
+
+  final List<Object?> props = [name];
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Props detect field no override: parsed")
+  if clazz then
+    local blocks = incremental.detect_blocks(clazz, lines)
+    ok(blocks.props ~= nil, "Props detect field no override: detected")
+    if blocks.props then
+      eq(blocks.props.props_style, "field", "Props detect field no override: style=field")
+      eq(blocks.props.has_override, false, "Props detect field no override: has_override=false")
+    end
+  end
+end
+
+-- 16f. Field: final props = [...]; (inferred type)
+do
+  local text = [[class F extends Equatable {
+  final String name;
+
+  final props = [name];
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Props detect field inferred type: parsed")
+  if clazz then
+    local blocks = incremental.detect_blocks(clazz, lines)
+    ok(blocks.props ~= nil, "Props detect field inferred type: detected")
+    if blocks.props then
+      eq(blocks.props.props_style, "field", "Props detect field inferred type: style=field")
+    end
+  end
+end
+
+-- 16g. Method: List<Object?> props() => [...];
+do
+  local text = [[class G extends Equatable {
+  final String name;
+
+  List<Object?> props() => [name];
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Props detect method arrow: parsed")
+  if clazz then
+    local blocks = incremental.detect_blocks(clazz, lines)
+    ok(blocks.props ~= nil, "Props detect method arrow: detected")
+    if blocks.props then
+      eq(blocks.props.props_style, "method", "Props detect method arrow: style=method")
+      eq(blocks.props.has_override, false, "Props detect method arrow: has_override=false")
+    end
+  end
+end
+
+-- 16h. Method with block body
+do
+  local text = [[class H extends Equatable {
+  final String name;
+  final int age;
+
+  @override
+  List<Object?> props() {
+    return [name, age];
+  }
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Props detect method block: parsed")
+  if clazz then
+    local blocks = incremental.detect_blocks(clazz, lines)
+    ok(blocks.props ~= nil, "Props detect method block: detected")
+    if blocks.props then
+      eq(blocks.props.props_style, "method", "Props detect method block: style=method")
+      eq(blocks.props.has_override, true, "Props detect method block: has_override=true")
+      eq(#blocks.props.fields, 2, "Props detect method block: 2 fields")
+    end
+  end
+end
+
+-- 16i. Method: props() => [...]; (no return type)
+do
+  local text = [[class I extends Equatable {
+  final String name;
+
+  props() => [name];
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Props detect method no return type: parsed")
+  if clazz then
+    local blocks = incremental.detect_blocks(clazz, lines)
+    ok(blocks.props ~= nil, "Props detect method no return type: detected")
+    if blocks.props then
+      eq(blocks.props.props_style, "method", "Props detect method no return type: style=method")
+    end
+  end
+end
+
+-- ===========================================================================
+-- 17. Style-preserving update: existing props get [...] replaced in-place
+-- ===========================================================================
+io.write("\n--- Style-preserving props update ---\n")
+
+-- 17a. Getter arrow: update by replacing [...] content
+do
+  local text = [[class PA extends Equatable {
+  final String name;
+  final int age;
+  final String email;
+
+  @override
+  List<Object?> get props => [name];
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Props update getter arrow: parsed")
+  if clazz then
+    local blocks = incremental.detect_blocks(clazz, lines)
+    ok(blocks.props ~= nil, "Props update getter arrow: block detected")
+    local gen_text = generator.generate_props(clazz, blocks.props)
+    ok(gen_text:find("@override", 1, true) ~= nil, "Props update getter arrow: preserved @override")
+    ok(gen_text:find("get props =>", 1, true) ~= nil, "Props update getter arrow: preserved getter arrow")
+    ok(gen_text:find("[name, age, email]", 1, true) ~= nil, "Props update getter arrow: updated fields")
+    -- Should NOT contain duplicate @override or get props
+    local _, count = gen_text:gsub("@override", "@override")
+    eq(count, 1, "Props update getter arrow: single @override")
+  end
+end
+
+-- 17b. Getter arrow WITHOUT @override: update preserves no-@override
+do
+  local text = [[class PB extends Equatable {
+  final String name;
+  final int age;
+
+  List<Object?> get props => [name];
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Props update getter no override: parsed")
+  if clazz then
+    local blocks = incremental.detect_blocks(clazz, lines)
+    ok(blocks.props ~= nil, "Props update getter no override: block detected")
+    local gen_text = generator.generate_props(clazz, blocks.props)
+    ok(gen_text:find("@override") == nil, "Props update getter no override: no @override added")
+    ok(gen_text:find("get props =>", 1, true) ~= nil, "Props update getter no override: preserved getter")
+    ok(gen_text:find("[name, age]", 1, true) ~= nil, "Props update getter no override: updated fields")
+  end
+end
+
+-- 17c. Getter block body: update replaces [...]
+do
+  local text = [[class PC extends Equatable {
+  final String name;
+  final int age;
+
+  @override
+  List<Object?> get props {
+    return [name];
+  }
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Props update getter block: parsed")
+  if clazz then
+    local blocks = incremental.detect_blocks(clazz, lines)
+    ok(blocks.props ~= nil, "Props update getter block: block detected")
+    local gen_text = generator.generate_props(clazz, blocks.props)
+    ok(gen_text:find("@override", 1, true) ~= nil, "Props update getter block: preserved @override")
+    ok(gen_text:find("get props", 1, true) ~= nil, "Props update getter block: preserved getter")
+    ok(gen_text:find("return %[name, age%]") ~= nil, "Props update getter block: updated fields")
+    -- Should NOT have =>
+    ok(gen_text:find("=>") == nil, "Props update getter block: no arrow")
+  end
+end
+
+-- 17d. Field with @override: update replaces [...] content
+do
+  local text = [[class PD extends Equatable {
+  final String name;
+  final int age;
+
+  @override
+  final List<Object?> props = [name];
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Props update field: parsed")
+  if clazz then
+    local blocks = incremental.detect_blocks(clazz, lines)
+    ok(blocks.props ~= nil, "Props update field: block detected")
+    local gen_text = generator.generate_props(clazz, blocks.props)
+    ok(gen_text:find("@override", 1, true) ~= nil, "Props update field: preserved @override")
+    ok(gen_text:find("final List<Object%?> props = ", 1, false) ~= nil, "Props update field: preserved field syntax")
+    ok(gen_text:find("[name, age]", 1, true) ~= nil, "Props update field: updated fields")
+  end
+end
+
+-- 17e. Method arrow: update replaces [...] content
+do
+  local text = [[class PE extends Equatable {
+  final String name;
+  final int age;
+
+  List<Object?> props() => [name];
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Props update method arrow: parsed")
+  if clazz then
+    local blocks = incremental.detect_blocks(clazz, lines)
+    ok(blocks.props ~= nil, "Props update method arrow: block detected")
+    local gen_text = generator.generate_props(clazz, blocks.props)
+    ok(gen_text:find("props%(%) =>", 1, false) ~= nil, "Props update method arrow: preserved method arrow")
+    ok(gen_text:find("[name, age]", 1, true) ~= nil, "Props update method arrow: updated fields")
+  end
+end
+
+-- 17f. Method block: update replaces [...] content
+do
+  local text = [[class PF extends Equatable {
+  final String name;
+  final int age;
+
+  @override
+  List<Object?> props() {
+    return [name];
+  }
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Props update method block: parsed")
+  if clazz then
+    local blocks = incremental.detect_blocks(clazz, lines)
+    ok(blocks.props ~= nil, "Props update method block: block detected")
+    local gen_text = generator.generate_props(clazz, blocks.props)
+    ok(gen_text:find("@override", 1, true) ~= nil, "Props update method block: preserved @override")
+    ok(gen_text:find("props%(%)", 1, false) ~= nil, "Props update method block: preserved method")
+    ok(gen_text:find("return %[name, age%]") ~= nil, "Props update method block: updated fields")
+  end
+end
+
+-- ===========================================================================
+-- 18. Idempotency for all styles: running update twice produces no edits
+-- ===========================================================================
+io.write("\n--- Idempotency for all props styles ---\n")
+
+-- 18a. Getter arrow (default) — add then verify idempotent
+do
+  local text = [[class IA extends Equatable {
+  final String name;
+  final int age;
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Idempotent getter arrow: parsed")
+  if clazz then
+    local kinds = { "constructor", "toString", "props" }
+    local new_lines, new_text, edit_count = generate_all_incremental(clazz, lines, kinds)
+    ok(edit_count > 0, "Idempotent getter arrow: edits produced")
+    ok(new_text:find("get props =>", 1, true) ~= nil, "Idempotent getter arrow: props generated")
+    verify_idempotent(new_lines, new_text, "IA", kinds)
+  end
+end
+
+-- 18b. Getter arrow existing — update then verify idempotent
+do
+  local text = [[class IB extends Equatable {
+  final String name;
+  final int age;
+
+  @override
+  List<Object?> get props => [name, age];
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Idempotent getter arrow existing: parsed")
+  if clazz then
+    local kinds = { "props" }
+    local new_lines, new_text, edit_count = generate_all_incremental(clazz, lines, kinds)
+    eq(edit_count, 0, "Idempotent getter arrow existing: no edits (already up to date)")
+    verify_idempotent(new_lines, new_text, "IB", kinds)
+  end
+end
+
+-- 18c. Getter block — update stale then verify idempotent
+do
+  local text = [[class IC extends Equatable {
+  final String name;
+  final int age;
+
+  @override
+  List<Object?> get props {
+    return [name];
+  }
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Idempotent getter block: parsed")
+  if clazz then
+    local kinds = { "props" }
+    local new_lines, new_text, edit_count = generate_all_incremental(clazz, lines, kinds)
+    ok(edit_count > 0, "Idempotent getter block: edits produced (stale)")
+    ok(new_text:find("return %[name, age%]") ~= nil, "Idempotent getter block: updated fields")
+    verify_idempotent(new_lines, new_text, "IC", kinds)
+  end
+end
+
+-- 18d. Field style — update stale then verify idempotent
+do
+  local text = [[class ID extends Equatable {
+  final String name;
+  final int age;
+
+  @override
+  final List<Object?> props = [name];
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Idempotent field: parsed")
+  if clazz then
+    local kinds = { "props" }
+    local new_lines, new_text, edit_count = generate_all_incremental(clazz, lines, kinds)
+    ok(edit_count > 0, "Idempotent field: edits produced (stale)")
+    ok(new_text:find("[name, age]", 1, true) ~= nil, "Idempotent field: updated fields")
+    verify_idempotent(new_lines, new_text, "ID", kinds)
+  end
+end
+
+-- 18e. Method arrow — update stale then verify idempotent
+do
+  local text = [[class IE extends Equatable {
+  final String name;
+  final int age;
+
+  List<Object?> props() => [name];
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Idempotent method arrow: parsed")
+  if clazz then
+    local kinds = { "props" }
+    local new_lines, new_text, edit_count = generate_all_incremental(clazz, lines, kinds)
+    ok(edit_count > 0, "Idempotent method arrow: edits produced (stale)")
+    verify_idempotent(new_lines, new_text, "IE", kinds)
+  end
+end
+
+-- 18f. Method block — update stale then verify idempotent
+do
+  local text = [[class IF extends Equatable {
+  final String name;
+  final int age;
+
+  @override
+  List<Object?> props() {
+    return [name];
+  }
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Idempotent method block: parsed")
+  if clazz then
+    local kinds = { "props" }
+    local new_lines, new_text, edit_count = generate_all_incremental(clazz, lines, kinds)
+    ok(edit_count > 0, "Idempotent method block: edits produced (stale)")
+    verify_idempotent(new_lines, new_text, "IF", kinds)
+  end
+end
+
+-- ===========================================================================
+-- 19. "Add props" vs "Update props" action title based on detection
+-- ===========================================================================
+io.write("\n--- Add vs Update props based on detection ---\n")
+
+-- 19a. No props exists → action title = "Add props"
+do
+  local text = [[class NoProps extends Equatable {
+  final String name;
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Add vs Update: no props parsed")
+  if clazz then
+    local blocks = incremental.detect_blocks(clazz, lines)
+    ok(blocks.props == nil, "Add vs Update: no props block detected")
+    local class_fields = incremental.get_class_field_names(clazz)
+    local status = incremental.props_status(blocks.props, class_fields)
+    eq(status, "absent", "Add vs Update: status is absent")
+    eq(actions.action_title("props", status), "Add props", "Add vs Update: title is 'Add props'")
+  end
+end
+
+-- 19b. Props exists as field → action title = "Update props"
+do
+  local text = [[class HasFieldProps extends Equatable {
+  final String name;
+  final int age;
+
+  @override
+  final List<Object?> props = [name];
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Add vs Update: field props parsed")
+  if clazz then
+    local blocks = incremental.detect_blocks(clazz, lines)
+    ok(blocks.props ~= nil, "Add vs Update: field props detected")
+    local class_fields = incremental.get_class_field_names(clazz)
+    local status = incremental.props_status(blocks.props, class_fields)
+    eq(status, "stale", "Add vs Update: field status is stale")
+    eq(actions.action_title("props", status), "Update props", "Add vs Update: title is 'Update props'")
+  end
+end
+
+-- 19c. Props exists as method → action title = "Update props"
+do
+  local text = [[class HasMethodProps extends Equatable {
+  final String name;
+  final int age;
+
+  List<Object?> props() => [name];
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Add vs Update: method props parsed")
+  if clazz then
+    local blocks = incremental.detect_blocks(clazz, lines)
+    ok(blocks.props ~= nil, "Add vs Update: method props detected")
+    local class_fields = incremental.get_class_field_names(clazz)
+    local status = incremental.props_status(blocks.props, class_fields)
+    eq(status, "stale", "Add vs Update: method status is stale")
+    eq(actions.action_title("props", status), "Update props", "Add vs Update: title is 'Update props'")
+  end
+end
+
+-- 19d. Props complete (all fields match) → still "Update props" (not "Add")
+do
+  local text = [[class HasCompleteProps extends Equatable {
+  final String name;
+  final int age;
+
+  @override
+  List<Object?> get props => [name, age];
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Add vs Update: complete props parsed")
+  if clazz then
+    local blocks = incremental.detect_blocks(clazz, lines)
+    ok(blocks.props ~= nil, "Add vs Update: complete props detected")
+    local class_fields = incremental.get_class_field_names(clazz)
+    local status = incremental.props_status(blocks.props, class_fields)
+    eq(status, "complete", "Add vs Update: status is complete")
+    eq(actions.action_title("props", status), "Update props", "Add vs Update: title is 'Update props' for complete")
+  end
+end
+
+-- ===========================================================================
+-- 20. apply_single_action for props: all styles
+-- ===========================================================================
+io.write("\n--- apply_single_action for props ---\n")
+
+-- 20a. Add props to class with no props
+do
+  local text = [[class AddProps extends Equatable {
+  final String name;
+  final int age;
+}
+]]
+  local _, lines = parse_class_lines(text)
+  local new_lines, new_text, edits = apply_single_action(lines, "AddProps", "props")
+  ok(edits > 0, "apply_single props add: edits produced")
+  ok(new_text:find("@override", 1, true) ~= nil, "apply_single props add: has @override")
+  ok(new_text:find("get props =>", 1, true) ~= nil, "apply_single props add: has getter")
+  ok(new_text:find("[name, age]", 1, true) ~= nil, "apply_single props add: correct fields")
+  -- Idempotent
+  local new_lines2, _, edits2 = apply_single_action(new_lines, "AddProps", "props")
+  eq(edits2, 0, "apply_single props add: idempotent")
+end
+
+-- 20b. Update existing getter arrow
+do
+  local text = [[class UpdateGetter extends Equatable {
+  final String name;
+  final int age;
+  final String email;
+
+  @override
+  List<Object?> get props => [name];
+}
+]]
+  local _, lines = parse_class_lines(text)
+  local new_lines, new_text, edits = apply_single_action(lines, "UpdateGetter", "props")
+  ok(edits > 0, "apply_single props update getter: edits produced")
+  ok(new_text:find("[name, age, email]", 1, true) ~= nil, "apply_single props update getter: all fields")
+  ok(new_text:find("get props =>", 1, true) ~= nil, "apply_single props update getter: still getter arrow")
+  -- Idempotent
+  local _, _, edits2 = apply_single_action(new_lines, "UpdateGetter", "props")
+  eq(edits2, 0, "apply_single props update getter: idempotent")
+end
+
+-- 20c. Update existing field
+do
+  local text = [[class UpdateField extends Equatable {
+  final String name;
+  final int age;
+
+  @override
+  final List<Object?> props = [name];
+}
+]]
+  local _, lines = parse_class_lines(text)
+  local new_lines, new_text, edits = apply_single_action(lines, "UpdateField", "props")
+  ok(edits > 0, "apply_single props update field: edits produced")
+  ok(new_text:find("[name, age]", 1, true) ~= nil, "apply_single props update field: all fields")
+  ok(new_text:find("final List<Object%?> props = ") ~= nil, "apply_single props update field: still field")
+  -- Idempotent
+  local _, _, edits2 = apply_single_action(new_lines, "UpdateField", "props")
+  eq(edits2, 0, "apply_single props update field: idempotent")
+end
+
+-- 20d. Update existing method arrow
+do
+  local text = [[class UpdateMethod extends Equatable {
+  final String name;
+  final int age;
+
+  List<Object?> props() => [name];
+}
+]]
+  local _, lines = parse_class_lines(text)
+  local new_lines, new_text, edits = apply_single_action(lines, "UpdateMethod", "props")
+  ok(edits > 0, "apply_single props update method: edits produced")
+  ok(new_text:find("[name, age]", 1, true) ~= nil, "apply_single props update method: all fields")
+  ok(new_text:find("props%(%) =>", 1, false) ~= nil, "apply_single props update method: still method arrow")
+  -- Idempotent
+  local _, _, edits2 = apply_single_action(new_lines, "UpdateMethod", "props")
+  eq(edits2, 0, "apply_single props update method: idempotent")
+end
+
+-- 20e. Update existing method block
+do
+  local text = [[class UpdateMethodBlock extends Equatable {
+  final String name;
+  final int age;
+
+  @override
+  List<Object?> props() {
+    return [name];
+  }
+}
+]]
+  local _, lines = parse_class_lines(text)
+  local new_lines, new_text, edits = apply_single_action(lines, "UpdateMethodBlock", "props")
+  ok(edits > 0, "apply_single props update method block: edits produced")
+  ok(new_text:find("return %[name, age%]") ~= nil, "apply_single props update method block: updated fields")
+  ok(new_text:find("@override", 1, true) ~= nil, "apply_single props update method block: preserved @override")
+  -- Idempotent
+  local _, _, edits2 = apply_single_action(new_lines, "UpdateMethodBlock", "props")
+  eq(edits2, 0, "apply_single props update method block: idempotent")
+end
+
+-- ===========================================================================
+-- 21. apply_update_existing for props: update stale field/method/getter
+-- ===========================================================================
+io.write("\n--- apply_update_existing for props ---\n")
+
+-- 21a. Stale getter → updated
+do
+  local text = [[class UGetter extends Equatable {
+  final String name;
+  final int age;
+
+  @override
+  List<Object?> get props => [name];
+}
+]]
+  local _, lines = parse_class_lines(text)
+  local new_lines, new_text, edit_count = apply_update_existing(lines, "UGetter")
+  ok(edit_count > 0, "apply_update_existing getter: edits produced")
+  ok(new_text:find("[name, age]", 1, true) ~= nil, "apply_update_existing getter: fields updated")
+  -- Idempotent
+  local _, _, edit_count2 = apply_update_existing(new_lines, "UGetter")
+  eq(edit_count2, 0, "apply_update_existing getter: idempotent")
+end
+
+-- 21b. Stale field → updated
+do
+  local text = [[class UField extends Equatable {
+  final String name;
+  final int age;
+
+  @override
+  final List<Object?> props = [name];
+}
+]]
+  local _, lines = parse_class_lines(text)
+  local new_lines, new_text, edit_count = apply_update_existing(lines, "UField")
+  ok(edit_count > 0, "apply_update_existing field: edits produced")
+  ok(new_text:find("[name, age]", 1, true) ~= nil, "apply_update_existing field: fields updated")
+  local _, _, edit_count2 = apply_update_existing(new_lines, "UField")
+  eq(edit_count2, 0, "apply_update_existing field: idempotent")
+end
+
+-- 21c. Stale method arrow → updated
+do
+  local text = [[class UMethodArrow extends Equatable {
+  final String name;
+  final int age;
+
+  List<Object?> props() => [name];
+}
+]]
+  local _, lines = parse_class_lines(text)
+  local new_lines, new_text, edit_count = apply_update_existing(lines, "UMethodArrow")
+  ok(edit_count > 0, "apply_update_existing method arrow: edits produced")
+  ok(new_text:find("[name, age]", 1, true) ~= nil, "apply_update_existing method arrow: fields updated")
+  local _, _, edit_count2 = apply_update_existing(new_lines, "UMethodArrow")
+  eq(edit_count2, 0, "apply_update_existing method arrow: idempotent")
+end
+
+-- 21d. Stale method block → updated
+do
+  local text = [[class UMethodBlock extends Equatable {
+  final String name;
+  final int age;
+
+  @override
+  List<Object?> props() {
+    return [name];
+  }
+}
+]]
+  local _, lines = parse_class_lines(text)
+  local new_lines, new_text, edit_count = apply_update_existing(lines, "UMethodBlock")
+  ok(edit_count > 0, "apply_update_existing method block: edits produced")
+  ok(new_text:find("return %[name, age%]") ~= nil, "apply_update_existing method block: fields updated")
+  local _, _, edit_count2 = apply_update_existing(new_lines, "UMethodBlock")
+  eq(edit_count2, 0, "apply_update_existing method block: idempotent")
+end
+
+-- ===========================================================================
+-- 22. No duplicate props: ensure a second props is NEVER created
+-- ===========================================================================
+io.write("\n--- No duplicate props ---\n")
+
+-- 22a. Class with existing field props → generate_all_incremental with "props" kind should update, not add
+do
+  local text = [[class NoDup extends Equatable {
+  final String name;
+  final int age;
+
+  final List<Object?> props = [name];
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "No dup props field: parsed")
+  if clazz then
+    local kinds = { "constructor", "toString", "props" }
+    local new_lines, new_text, edit_count = generate_all_incremental(clazz, lines, kinds)
+    ok(edit_count > 0, "No dup props field: edits produced")
+    -- Count how many times "props" appears as a member (not in field declarations)
+    local count = 0
+    for _ in new_text:gmatch("props%s*=") do count = count + 1 end
+    for _ in new_text:gmatch("get%s+props") do count = count + 1 end
+    for _ in new_text:gmatch("props%(%)") do count = count + 1 end
+    eq(count, 1, "No dup props field: exactly one props member")
+  end
+end
+
+-- 22b. Class with method props → props kind should update, not add a second
+do
+  local text = [[class NoDupMethod extends Equatable {
+  final String name;
+  final int age;
+
+  @override
+  List<Object?> props() => [name];
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "No dup props method: parsed")
+  if clazz then
+    local kinds = { "constructor", "toString", "props" }
+    local new_lines, new_text, edit_count = generate_all_incremental(clazz, lines, kinds)
+    ok(edit_count > 0, "No dup props method: edits produced")
+    local count = 0
+    for _ in new_text:gmatch("props%s*=") do count = count + 1 end
+    for _ in new_text:gmatch("get%s+props") do count = count + 1 end
+    for _ in new_text:gmatch("props%(%)") do count = count + 1 end
+    eq(count, 1, "No dup props method: exactly one props member")
+  end
+end
+
+-- ===========================================================================
+-- 23. Field removal: orphan fields removed when class field is deleted
+-- ===========================================================================
+io.write("\n--- Props field removal (orphans) ---\n")
+do
+  -- Start with 3 fields, props has all 3
+  local text = [[class Orphan extends Equatable {
+  final String name;
+  final int age;
+
+  @override
+  List<Object?> get props => [name, age, email];
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Props orphan removal: parsed")
+  if clazz then
+    local blocks = incremental.detect_blocks(clazz, lines)
+    ok(blocks.props ~= nil, "Props orphan removal: block detected")
+    local class_fields = incremental.get_class_field_names(clazz)
+    local status = incremental.props_status(blocks.props, class_fields)
+    eq(status, "stale", "Props orphan removal: status is stale (orphan email)")
+
+    -- Generate updated props — should only have name and age (email is orphan)
+    local gen_text = generator.generate_props(clazz, blocks.props)
+    ok(gen_text:find("[name, age]", 1, true) ~= nil, "Props orphan removal: email removed")
+    ok(gen_text:find("email") == nil, "Props orphan removal: no email in output")
+  end
+end
+
+-- ===========================================================================
+-- 24. Getter without explicit type: "get props => ..." shorthand
+-- ===========================================================================
+io.write("\n--- Getter shorthand detection ---\n")
+do
+  local text = [[class Short extends Equatable {
+  final String name;
+
+  @override
+  get props => [name];
+}
+]]
+  local clazz, lines = parse_class_lines(text)
+  ok(clazz ~= nil, "Getter shorthand: parsed")
+  if clazz then
+    local blocks = incremental.detect_blocks(clazz, lines)
+    ok(blocks.props ~= nil, "Getter shorthand: detected")
+    if blocks.props then
+      eq(blocks.props.props_style, "getter", "Getter shorthand: style=getter")
+    end
+  end
+end
 io.write("\n==========================================\n")
 io.write(string.format("Results: %d passed, %d failed\n", passed, failed))
 if failed > 0 then
